@@ -1,0 +1,13 @@
+﻿Experiment,Source Domain,Target Domain,Final Target Accuracy,Overall Target Accuracy,Source Accuracy,Unlearned Samples,Selected Target Samples,Training Time (min),Status
+Art2Clipart,Art,Clipart,FAILED,FAILED,FAILED,FAILED,FAILED,6.9,FAILED
+Art2Product,Art,Product,FAILED,FAILED,FAILED,FAILED,FAILED,6.6,FAILED
+Art2Real World,Art,Real World,FAILED,FAILED,FAILED,FAILED,FAILED,6.9,FAILED
+Clipart2Art,Clipart,Art,FAILED,FAILED,FAILED,FAILED,FAILED,6.0,FAILED
+Clipart2Product,Clipart,Product,FAILED,FAILED,FAILED,FAILED,FAILED,6.0,FAILED
+Clipart2Real World,Clipart,Real World,FAILED,FAILED,FAILED,FAILED,FAILED,6.2,FAILED
+Product2Art,Product,Art,FAILED,FAILED,FAILED,FAILED,FAILED,6.5,FAILED
+Product2Clipart,Product,Clipart,FAILED,FAILED,FAILED,FAILED,FAILED,6.2,FAILED
+Product2Real World,Product,Real World,FAILED,FAILED,FAILED,FAILED,FAILED,6.3,FAILED
+Real World2Art,Real World,Art,FAILED,FAILED,FAILED,FAILED,FAILED,22.8,FAILED
+Real World2Clipart,Real World,Clipart,FAILED,FAILED,FAILED,FAILED,FAILED,22.0,FAILED
+Real World2Product,Real World,Product,FAILED,FAILED,FAILED,FAILED,FAILED,22.5,FAILED

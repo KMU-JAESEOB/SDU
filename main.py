@@ -536,6 +536,89 @@ def compute_influence_scores_enhanced(model, source_loader, target_batch, num_sa
     return influence_scores
 
 # 9. 하이브리드 스코어링 (논문 구현)
+def unsupervised_target_sample_selection(model, target_loader, num_samples=800):
+    """타겟 라벨을 모른다고 가정하고 불확실성 기반으로 타겟 샘플 선별"""
+    print(f"🎯 1단계: 불확실성 기반 타겟 샘플 선별 ({num_samples}개)")
+    
+    model.eval()
+    uncertainty_scores = []
+    all_samples = []
+    
+    with torch.no_grad():
+        for batch_idx, batch_data in enumerate(target_loader):
+            # 배치 데이터 처리 (라벨 유무에 관계없이)
+            if len(batch_data) == 2:
+                data, labels = batch_data
+            else:
+                data = batch_data
+                labels = None
+            
+            data = data.to(device)
+            output = model(data)
+            probs = torch.softmax(output, dim=1)
+            
+            # 불확실성 계산 (엔트로피)
+            for i in range(data.size(0)):
+                sample_probs = probs[i]
+                entropy = -torch.sum(sample_probs * torch.log(sample_probs + 1e-8)).item()
+                
+                uncertainty_scores.append(entropy)
+                if labels is not None:
+                    all_samples.append((data[i].cpu(), labels[i].cpu()))
+                else:
+                    all_samples.append((data[i].cpu(), torch.tensor(0)))  # 더미 라벨
+    
+    # 불확실성이 높은 순으로 정렬하여 상위 num_samples개 선택
+    sorted_indices = sorted(range(len(uncertainty_scores)), 
+                           key=lambda i: uncertainty_scores[i], reverse=True)
+    
+    selected_samples = [all_samples[i] for i in sorted_indices[:num_samples]]
+    selected_scores = [uncertainty_scores[i] for i in sorted_indices[:num_samples]]
+    
+    print(f"✅ 불확실성 기반 타겟 샘플 선별 완료: {len(selected_samples)}개")
+    print(f"📊 평균 불확실성: {np.mean(selected_scores):.4f}")
+    
+    return selected_samples, selected_scores
+
+def compute_influence_and_select_harmful(model, source_loader, target_samples, num_harmful=50):
+    """선별된 타겟 샘플과 비교하여 유해한 소스 샘플 선별"""
+    print(f"🎯 2단계: 유해 소스 샘플 선별 ({num_harmful}개)")
+    
+    # 타겟 샘플들에 대한 영향도 계산
+    target_batch_for_influence = []
+    for i, (data, label) in enumerate(target_samples[:100]):  # 처음 100개만 사용
+        target_batch_for_influence.append((data, label))
+    
+    # 영향도 점수 계산
+    influence_scores = compute_influence_scores_enhanced(
+        model, source_loader, target_batch_for_influence, num_samples=500)
+    
+    # 영향도가 가장 높은 (유해한) 소스 샘플들 선별
+    harmful_indices = sorted(range(len(influence_scores)), 
+                           key=lambda i: abs(influence_scores[i]), reverse=True)[:num_harmful]
+    
+    # 유해한 소스 샘플들 수집
+    harmful_samples = []
+    harmful_scores = []
+    
+    sample_count = 0
+    for batch_idx, (data, labels) in enumerate(source_loader):
+        for i in range(data.size(0)):
+            if sample_count in harmful_indices:
+                harmful_samples.append((data[i].cpu(), labels[i].cpu()))
+                harmful_scores.append(influence_scores[sample_count])
+            sample_count += 1
+            
+            if len(harmful_samples) >= num_harmful:
+                break
+        if len(harmful_samples) >= num_harmful:
+            break
+    
+    print(f"✅ 유해 소스 샘플 선별 완료: {len(harmful_samples)}개")
+    print(f"📊 평균 영향도: {np.mean([abs(s) for s in harmful_scores]):.4f}")
+    
+    return harmful_samples, harmful_scores
+
 def compute_hybrid_scores(model, target_samples, influence_scores, lambda_u=0.6, beta=0.1):
     """논문의 하이브리드 스코어링: S(x) = λ_u·I(x;θ') + (1-λ_u)·div(x, D_T^sub) + β·H(x)"""
     print("🎯 하이브리드 스코어 계산 중...")
@@ -544,10 +627,16 @@ def compute_hybrid_scores(model, target_samples, influence_scores, lambda_u=0.6,
     hybrid_scores = []
     
     with torch.no_grad():
-        for i, (data, _) in enumerate(target_samples):
+        for i, sample in enumerate(target_samples):
             if i >= len(influence_scores):
                 break
                 
+            # 샘플 데이터 처리 - 유연한 언패킹
+            if isinstance(sample, (tuple, list)) and len(sample) >= 2:
+                data, _ = sample[0], sample[1]
+            else:
+                data = sample
+            
             # 데이터를 디바이스로 이동하고 배치 차원 추가
             data = data.to(device)
             if len(data.shape) == 3:  # [C, H, W] -> [1, C, H, W]
@@ -670,18 +759,17 @@ def perform_dos_unlearning(model, harmful_data, influence_scores, num_steps=5):
 
 # 11. 타겟 도메인 재학습 (Self-training)
 def retrain_with_curated_target_samples(model, curated_samples, adaptation_epochs=5):
-    """큐레이션된 타겟 샘플로 Self-training 수행"""
-    print(f"🎓 큐레이션된 타겟 샘플로 재학습 시작 ({adaptation_epochs}에포크)")
+    """큐레이션된 타겟 샘플로 Fine-tuning 수행 (실제 라벨 사용)"""
+    print(f"🎓 4단계: 선별된 타겟 샘플로 Fine-tuning ({adaptation_epochs}에포크)")
+    print("📋 중요: 이 단계에서는 실제 타겟 라벨을 사용합니다!")
     
     model.train()
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     
-    confidence_threshold = 0.8  # 확신 있는 예측만 사용
-    
     for epoch in range(adaptation_epochs):
         total_loss = 0.0
-        confident_samples = 0
+        correct_predictions = 0
         total_samples = 0
         
         # 배치 단위로 처리
@@ -689,49 +777,47 @@ def retrain_with_curated_target_samples(model, curated_samples, adaptation_epoch
         for i in range(0, len(curated_samples), batch_size):
             batch_end = min(i + batch_size, len(curated_samples))
             batch_data = []
+            batch_labels = []
             
             for j in range(i, batch_end):
-                data, _ = curated_samples[j]  # 실제 라벨 무시
+                data, label = curated_samples[j]  # ✅ 실제 라벨 사용 (Fine-tuning용)
                 batch_data.append(data)
+                batch_labels.append(label)
             
             if len(batch_data) == 0:
                 continue
                 
             batch_tensor = torch.stack(batch_data).to(device)
+            batch_labels_tensor = torch.stack(batch_labels).to(device)
             
-            # Pseudo-label 생성 및 확신도 계산
-            with torch.no_grad():
-                output = model(batch_tensor)
-                probs = torch.softmax(output, dim=1)
-                confidence, pseudo_labels = torch.max(probs, dim=1)
+            # 🚨 클래스 수 안전 검증
+            num_classes = model.fc.out_features if hasattr(model, 'fc') else model.classifier[-1].out_features
+            batch_labels_tensor = torch.clamp(batch_labels_tensor, 0, num_classes - 1)
             
-            # 확신 있는 샘플만 선별
-            confident_mask = confidence > confidence_threshold
             total_samples += len(batch_data)
             
-            if confident_mask.sum() > 0:
-                confident_data = batch_tensor[confident_mask]
-                confident_labels = pseudo_labels[confident_mask]
-                confident_samples += confident_mask.sum().item()
-                
-                # 확신 있는 샘플로 학습
-                optimizer.zero_grad()
-                output = model(confident_data)
-                loss = criterion(output, confident_labels)
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
+            # 실제 라벨로 Fine-tuning
+            optimizer.zero_grad()
+            output = model(batch_tensor)
+            loss = criterion(output, batch_labels_tensor)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            # 정확도 계산
+            _, predicted = torch.max(output.data, 1)
+            correct_predictions += (predicted == batch_labels_tensor).sum().item()
         
-        avg_loss = total_loss / max(1, confident_samples)
-        confidence_ratio = confident_samples / max(1, total_samples)
+        avg_loss = total_loss / max(1, total_samples // batch_size)
+        accuracy = correct_predictions / max(1, total_samples) * 100
         
         if (epoch + 1) % 2 == 0:
             print(f"  에포크 {epoch+1}/{adaptation_epochs}: "
                   f"손실={avg_loss:.4f}, "
-                  f"확신 샘플={confident_samples}/{total_samples} ({confidence_ratio:.1%})")
+                  f"정확도={accuracy:.1f}% ({correct_predictions}/{total_samples})")
     
-    print(f"✅ 타겟 도메인 재학습 완료 (최종 확신도: {confidence_ratio:.1%})")
+    print(f"✅ 타겟 도메인 Fine-tuning 완료 (최종 정확도: {accuracy:.1f}%)")
 
 # 12. 향상된 평가 함수
 def evaluate_model(model, data_loader, max_batches=20, domain_name=""):
@@ -887,6 +973,14 @@ def main():
     parser.add_argument('--model_save_dir', type=str, default='models', help='모델 저장 디렉토리')
     parser.add_argument('--results_file', type=str, default='results/sda_u_comprehensive_results.json', help='결과 파일 경로')
     
+    # 🚀 사전 훈련 모델 관련 옵션
+    parser.add_argument('--pretrained_model', type=str, default=None, 
+                       help='사전 훈련된 모델 경로 (있으면 소스 도메인 훈련 스킵)')
+    parser.add_argument('--skip_source_training', action='store_true', 
+                       help='소스 도메인 훈련 스킵 (사전 훈련된 가중치 사용)')
+    parser.add_argument('--use_pretrained_weights', action='store_true', default=True,
+                       help='ImageNet 사전 훈련 가중치 사용')
+    
     args = parser.parse_args()
 
     # GPU 설정 및 최적화
@@ -918,125 +1012,58 @@ def main():
     print("="*80)
     
     try:
-        # 1. 소스 도메인 사전 훈련
-        print("📚 1단계: 소스 도메인 사전 훈련")
-        train_model_with_evaluation(model, source_train_loader, source_test_loader, num_epochs=args.num_epochs, 
-                                  source_domain=args.source_domain, target_domain=args.target_domain)
+        # 🚀 사전 훈련된 모델 로드 또는 소스 도메인 훈련
+        if args.pretrained_model and os.path.exists(args.pretrained_model):
+            print(f"📦 사전 훈련된 모델 로드: {args.pretrained_model}")
+            checkpoint = torch.load(args.pretrained_model, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("✅ 사전 훈련된 모델 로드 완료!")
+            
+        elif args.skip_source_training:
+            print("⏭️ 소스 도메인 훈련 스킵 - ImageNet 사전 훈련 가중치만 사용")
+            print("💡 이 모드에서는 ResNet 등의 ImageNet 사전 훈련 가중치를 그대로 사용합니다")
+            
+        else:
+            # 1. 소스 도메인 사전 훈련
+            print("📚 1단계: 소스 도메인 사전 훈련")
+            train_model_with_evaluation(model, source_train_loader, source_test_loader, num_epochs=args.num_epochs, 
+                                      source_domain=args.source_domain, target_domain=args.target_domain)
         
         # 2. 타겟 도메인 평가 (사전 훈련 후)
         print("\n📊 2단계: 타겟 도메인 초기 평가")
         initial_target_acc = evaluate_model(model, target_test_loader, domain_name="타겟(초기)")
         
-        # 3. 올바른 타겟 서브셋 큐레이션 (순서 수정)
-        print("\n🎯 3단계: 타겟 서브셋 큐레이션 (올바른 순서)")
+        # 소스 도메인 초기 성능도 측정 (참고용)
+        initial_source_acc = evaluate_model(model, source_test_loader, domain_name="소스(초기)")
+        print(f"📊 소스 도메인 초기 성능: {initial_source_acc:.2f}%")
         
-        # 3-1. 큰 타겟 후보군 준비
-        print("📦 3-1단계: 타겟 후보군 준비")
-        candidate_batches = []
-        target_batch_iter = iter(target_train_loader)
+        # 3. 올바른 SDA-U 알고리즘 수행
+        print("\n🎯 SDA-U 알고리즘 시작 (올바른 순서)")
         
-        # 후보군 크기 계산 (target_samples의 2-3배로 충분한 후보군 확보)
-        candidate_samples_needed = min(args.target_samples * 3, 1200)  # 최대 1200개
-        num_batches_needed = (candidate_samples_needed + args.batch_size - 1) // args.batch_size
+        # 3-1. 타겟 샘플 선별 (라벨 없이)
+        curated_samples, uncertainty_scores = unsupervised_target_sample_selection(
+            model, target_train_loader, num_samples=args.target_samples)
         
-        print(f"🎯 목표 후보군: {candidate_samples_needed}개 ({num_batches_needed}개 배치)")
+        # 3-2. 유해한 소스 샘플 선별
+        harmful_samples, harmful_scores = compute_influence_and_select_harmful(
+            model, source_train_loader, curated_samples, num_harmful=50)
         
-        for batch_idx in range(num_batches_needed):
-            try:
-                batch = next(target_batch_iter)
-                candidate_batches.append(batch)
-            except StopIteration:
-                print(f"⚠️ 데이터 부족: {batch_idx}개 배치만 수집됨")
-                break
-        
-        total_candidates = sum(len(batch[0]) for batch in candidate_batches)
-        print(f"✅ 후보군 준비 완료: {len(candidate_batches)}개 배치, {total_candidates}개 샘플")
-        
-        # 3-2. 전체 후보군에 대해 영향도 계산
-        print("🔍 3-2단계: 후보군 영향도 계산")
-        all_influence_scores = []
-        all_target_samples = []
-        
-        for batch_idx, batch in enumerate(candidate_batches):
-            print(f"  배치 {batch_idx+1}/{len(candidate_batches)} 영향도 계산 중...")
-            
-            influence_scores = compute_influence_scores_enhanced(
-                model, source_train_loader, batch, num_samples=args.influence_samples)
-            
-            all_influence_scores.extend(influence_scores)
-            
-            # 샘플 저장 (이후 큐레이션에 사용)
-            for i in range(len(batch[0])):
-                all_target_samples.append((batch[0][i], batch[1][i]))
-        
-        print(f"✅ 전체 영향도 계산 완료: {len(all_influence_scores)}개 샘플")
-        
-        # 3-3. 하이브리드 스코어링
-        print("🔢 3-3단계: 하이브리드 스코어링")
-        hybrid_scores = compute_hybrid_scores(
-            model, all_target_samples, all_influence_scores, 
-            lambda_u=args.lambda_u, beta=args.beta)
-        
-        print(f"✅ 하이브리드 스코어 계산 완료: {len(hybrid_scores)}개")
-        
-        # 3-4. 최종 타겟 서브셋 큐레이션 (상위 점수 기준 선택)
-        print("🎯 3-4단계: 최종 타겟 서브셋 큐레이션")
-        
-        # 큐레이션할 최종 서브셋 크기
-        final_subset_size = min(args.target_samples, len(hybrid_scores))
-        
-        # 하이브리드 스코어 기준으로 정렬 (높은 점수 순)
-        sorted_indices = sorted(range(len(hybrid_scores)), 
-                              key=lambda i: hybrid_scores[i], reverse=True)
-        
-        # 상위 점수 샘플들로 최종 서브셋 구성
-        curated_indices = sorted_indices[:final_subset_size]
-        curated_samples = [all_target_samples[i] for i in curated_indices]
-        curated_scores = [hybrid_scores[i] for i in curated_indices]
-        
-        print(f"✅ 최종 타겟 서브셋 큐레이션 완료: {len(curated_samples)}개 선별")
-        print(f"📊 큐레이션 비율: {len(curated_samples)}/{len(all_target_samples)} ({len(curated_samples)/len(all_target_samples)*100:.1f}%)")
-        print(f"📈 선별된 샘플 스코어 범위: {min(curated_scores):.4f} ~ {max(curated_scores):.4f}")
-        
-        # 기존 변수들을 큐레이션된 결과로 대체 (이후 코드 호환성)
-        target_batch = (
-            torch.stack([sample[0] for sample in curated_samples]),
-            torch.stack([sample[1] for sample in curated_samples])
-        )
-        influence_scores = [all_influence_scores[i] for i in curated_indices]
-        hybrid_scores = curated_scores
-        
-        # 4. 유해 샘플 식별 및 언러닝
-        print("\n🔄 4단계: DOS 언러닝 수행")
-        
-        # 상위 점수 샘플들을 유해 샘플로 간주
-        num_harmful = min(50, len(hybrid_scores) // 4)  # 상위 25% 또는 최대 50개
-        sorted_indices = sorted(range(len(hybrid_scores)), key=lambda i: hybrid_scores[i], reverse=True)
-        harmful_indices = sorted_indices[:num_harmful]
-        
-        harmful_data = []
-        for idx in harmful_indices:
-            if idx < len(target_batch[0]):
-                harmful_data.append((target_batch[0][idx], target_batch[1][idx]))
-        
-        print(f"🎯 유해 샘플 {len(harmful_data)}개 식별")
-        
-        # DOS 언러닝 수행
+        # 3-3. 머신 언러닝 수행
+        print("\n🔄 3단계: 머신 언러닝 수행")
         unlearn_losses = perform_dos_unlearning(
-            model, harmful_data, [hybrid_scores[i] for i in harmful_indices], 
+            model, harmful_samples, harmful_scores, 
             num_steps=args.unlearn_steps)
         
-        # 5. 큐레이션된 타겟 샘플로 재학습 (Self-training)
-        print("\n🎓 5단계: 타겟 도메인 재학습 (Self-training)")
+        # 3-4. 선별된 타겟 샘플로 Fine-tuning
         retrain_with_curated_target_samples(model, curated_samples, args.adaptation_epochs)
         
-        # 6. 최종 평가
-        print("\n📈 6단계: 최종 성능 평가")
+        # 4. 최종 평가
+        print("\n📈 4단계: 최종 성능 평가")
         final_source_acc = evaluate_model(model, source_test_loader, domain_name="소스(최종)")
         final_target_acc = evaluate_model(model, target_test_loader, domain_name="타겟(최종)")
         
-        # 7. 결과 저장
-        print("\n💾 7단계: 결과 저장")
+        # 5. 결과 저장
+        print("\n💾 5단계: 결과 저장")
         results = {
             'experiment_info': {
                 'dataset': args.dataset,
@@ -1046,14 +1073,16 @@ def main():
                 'num_classes': num_classes
             },
             'performance': {
+                'initial_source_accuracy': initial_source_acc,
                 'initial_target_accuracy': initial_target_acc,
                 'final_source_accuracy': final_source_acc,
                 'final_target_accuracy': final_target_acc,
-                'accuracy_improvement': final_target_acc - initial_target_acc
+                'target_improvement': final_target_acc - initial_target_acc,
+                'source_change': final_source_acc - initial_source_acc
             },
             'sda_u_metrics': {
-                'influence_samples': len(influence_scores),
-                'harmful_samples': len(harmful_data),
+                'harmful_samples': len(harmful_samples),
+                'curated_samples': len(curated_samples),
                 'unlearn_steps': args.unlearn_steps,
                 'unlearn_losses': unlearn_losses
             },
@@ -1090,6 +1119,18 @@ def main():
         
         print("\n🎉 SDA-U 실험 완료!")
         print(f"📊 타겟 정확도 향상: {initial_target_acc:.2f}% → {final_target_acc:.2f}% (+{final_target_acc-initial_target_acc:.2f}%)")
+        print(f"📊 소스 정확도 변화: {initial_source_acc:.2f}% → {final_source_acc:.2f}% ({final_source_acc-initial_source_acc:+.2f}%)")
+        
+        # 성능 요약
+        if final_target_acc > initial_target_acc:
+            print("✅ 타겟 도메인 성능 향상 성공!")
+        else:
+            print("❌ 타겟 도메인 성능 향상 실패")
+            
+        if abs(final_source_acc - initial_source_acc) < 2.0:  # 2% 이내 변화
+            print("✅ 소스 도메인 성능 유지 성공!")
+        else:
+            print("⚠️ 소스 도메인 성능 크게 변화됨")
         
     except Exception as e:
         print(f"\n❌ 실험 중 오류 발생: {str(e)}")

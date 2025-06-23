@@ -1,0 +1,58 @@
+{
+  "timestamp": "2025-06-23T14:46:08.676551",
+  "total_experiments": 12,
+  "successful_experiments": 0,
+  "failed_experiments": 12,
+  "skipped_experiments": 0,
+  "total_elapsed_time": 7496.6549243927,
+  "experiments": {
+    "Art2Clipart": {
+      "error": "results_file_not_found",
+      "elapsed_time": 416.8526384830475
+    },
+    "Art2Product": {
+      "error": "results_file_not_found",
+      "elapsed_time": 395.04545760154724
+    },
+    "Art2Real World": {
+      "error": "results_file_not_found",
+      "elapsed_time": 414.4237298965454
+    },
+    "Clipart2Art": {
+      "error": "results_file_not_found",
+      "elapsed_time": 358.82740592956543
+    },
+    "Clipart2Product": {
+      "error": "results_file_not_found",
+      "elapsed_time": 361.44610381126404
+    },
+    "Clipart2Real World": {
+      "error": "results_file_not_found",
+      "elapsed_time": 371.83657121658325
+    },
+    "Product2Art": {
+      "error": "results_file_not_found",
+      "elapsed_time": 390.06704568862915
+    },
+    "Product2Clipart": {
+      "error": "results_file_not_found",
+      "elapsed_time": 369.9584376811981
+    },
+    "Product2Real World": {
+      "error": "results_file_not_found",
+      "elapsed_time": 376.66580843925476
+    },
+    "Real World2Art": {
+      "error": "results_file_not_found",
+      "elapsed_time": 1368.7567074298859
+    },
+    "Real World2Clipart": {
+      "error": "results_file_not_found",
+      "elapsed_time": 1319.758348941803
+    },
+    "Real World2Product": {
+      "error": "results_file_not_found",
+      "elapsed_time": 1352.8534007072449
+    }
+  }
+}
