@@ -225,7 +225,12 @@ class OfficeHomeDataset(Dataset):
         img_path, class_name = self.samples[idx]
         
         # 이미지 로드
-        image = Image.open(img_path).convert('RGB')
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"⚠️ 이미지 로드 실패: {img_path}, {e}")
+            # 기본 이미지 생성
+            image = Image.new('RGB', (224, 224), color='white')
         
         # 변환 적용
         if self.transform:
@@ -240,6 +245,7 @@ class OfficeHomeDataset(Dataset):
             label = max(0, min(label, 64))  # 0-64 범위로 클리핑
             print(f"🔧 수정된 라벨: {label}")
         
+        # Office31과 동일하게 정수로 반환 (일관성을 위해)
         return image, label
 
 class OfficeHomeLoader:
@@ -276,7 +282,7 @@ class OfficeHomeLoader:
         return transform
     
     def load_domain_data(self, domain, batch_size=32, shuffle=True):
-        """특정 도메인 데이터 로드 (Dataset 반환)"""
+        """특정 도메인 데이터 로드 (DataLoader 반환)"""
         
         if domain not in self.domains:
             raise ValueError(f"지원하지 않는 도메인: {domain}")
@@ -297,8 +303,44 @@ class OfficeHomeLoader:
         
         print(f"✅ Office-Home {domain} 로딩 완료!")
         
-        # Dataset 반환 (main.py에서 DataLoader 생성)
-        return train_dataset, test_dataset
+        # OfficeHome 전용 collate_fn: 정수 라벨을 텐서로 변환
+        def officehome_collate_fn(batch):
+            """OfficeHome의 정수 라벨을 텐서로 변환하는 collate function"""
+            import torch
+            
+            images, labels = zip(*batch)
+            
+            # 이미지 스택
+            images = torch.stack(images)
+            
+            # 라벨을 텐서로 변환 (정수 리스트 → 텐서)
+            labels = torch.tensor(labels, dtype=torch.long)
+            
+            return images, labels
+        
+        # DataLoader 생성 (collate_fn으로 라벨 호환성 확보)
+        from torch.utils.data import DataLoader
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=shuffle,
+            collate_fn=officehome_collate_fn,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            collate_fn=officehome_collate_fn,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        # DataLoader 반환 (Office31과 호환)
+        return train_loader, test_loader
     
     def get_domain_info(self, domain):
         """도메인 정보 반환"""

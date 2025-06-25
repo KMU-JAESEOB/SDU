@@ -1,1139 +1,1327 @@
-#!/usr/bin/env python3
-# main.py - SDA-U 프레임워크 메인 실행 스크립트
+# main.py - 완전 객체지향 SDA-U 알고리즘
+"""
+🎯 완전 객체지향 SDA-U (Selective Domain Adaptation with Unlearning) 알고리즘
+
+주요 개선사항:
+1. 완전한 객체지향 설계 (클래스 기반)
+2. 설정 파일 분리 (config.json)
+3. 중복 함수 통합 및 제거
+4. 유지보수성 및 확장성 향상
+"""
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Subset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import numpy as np
-import json
-import os
-from datetime import datetime
-from tqdm import tqdm
-import warnings
+import copy
 import argparse
-warnings.filterwarnings('ignore')
+import os
+import json
+import random
+import sys
+from pathlib import Path
+import time
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass
 
-print("🚀 SDA-U 프레임워크 메인 실행!")
-print("=" * 60)
+# 실시간 출력을 위한 버퍼링 해제
+sys.stdout.reconfigure(line_buffering=True)
 
-# 설정 로드
+def flush_print(*args, **kwargs):
+    """즉시 출력되는 print 함수"""
+    print(*args, **kwargs)
+    sys.stdout.flush()
+
+# 데이터 로더
+from office31_loader import Office31Manager
+from officehome_loader import OfficeHomeLoader
+
+# GPU 설정
 try:
-    from config import get_config
-    config = get_config()
-    print(f"🚀 설정 로드 완료: {config['gpu_name']}")
+    from gpu_config import setup_gpu_optimizations, get_gpu_info
+    GPU_OPTIMIZED = True
 except ImportError:
-    # 폴백 설정
-    config = {
-        'batch_size': 64,
-        'num_epochs': 3,
-        'architecture': 'resnet50',  # 기존 모델로 변경
-        'target_subset_size': 1000,
-        'num_unlearn_steps': 5,
-        'influence_samples': 300,
-        'lambda_u': 0.6,
-        'beta': 0.1,
-        'learning_rate': 1e-3,
-        'save_models': True,
-        'save_results': True,
-        'gpu_name': 'Default'
-    }
-    print("⚙️ 기본 설정 사용 (ResNet50)")
-
-# 디바이스 설정
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"🔧 사용 디바이스: {device}")
-
-# 결과 저장 디렉토리 생성
-os.makedirs('models', exist_ok=True)
-os.makedirs('results', exist_ok=True)
+    GPU_OPTIMIZED = False
 
 # 전역 변수
-best_target_accuracy = 0.0
-performance_history = []
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 1. 데이터 변환 - Office-31 호환성 개선 (중복 제거)
-def get_transforms(architecture):
-    """아키텍처에 맞는 데이터 변환을 반환합니다 (Office-31 호환)"""
-    if 'vit' in architecture.lower():
-        # Vision Transformer는 224x224 크기 사용
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))  # ImageNet 정규화
-        ])
-    elif 'resnet' in architecture.lower():
-        # ResNet은 Office-31에 맞게 224x224, 3채널 사용
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))  # ImageNet 정규화
-        ])
-    else:
-        # 기본 변환 (Office-31 호환)
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-        ])
+@dataclass
+class ExperimentResults:
+    """실험 결과를 담는 데이터 클래스"""
+    initial_target_acc: float
+    final_target_acc: float
+    best_target_acc: float
+    best_epoch: int
+    improvement: float
+    best_improvement: float
+    unlearning_count: int
+    total_epochs: int
+    performance_history: Dict
+    model_paths: Dict[str, str]
 
-# 2. CNN 모델 정의
-class SimpleCNN(nn.Module):
-    def __init__(self, num_classes=31):  # Office-31에 맞게 기본값 변경
-        super(SimpleCNN, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),  # Office-31은 RGB 이미지
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(128, num_classes)
-        )
+class SDAUConfig:
+    """설정 관리 클래스"""
     
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        return x
+    def __init__(self, config_path: str = "config.json"):
+        """설정 파일 로딩"""
+        self.config_path = config_path
+        self.config = self._load_config()
+        self._validate_config()
+    
+    def _load_config(self) -> Dict:
+        """설정 파일 로딩"""
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"설정 파일을 찾을 수 없습니다: {self.config_path}")
+        
+        with open(self.config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    def _validate_config(self):
+        """설정 파일 검증"""
+        required_sections = ['model', 'training', 'target_selection', 
+                           'influence_calculation', 'unlearning', 'paths']
+        
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"필수 설정 섹션이 없습니다: {section}")
+    
+    def get(self, section: str, key: str = None, default=None):
+        """설정값 가져오기"""
+        if key is None:
+            return self.config.get(section, default)
+        return self.config.get(section, {}).get(key, default)
+    
+    def get_num_classes(self, dataset: str) -> int:
+        """데이터셋별 클래스 수 반환"""
+        return self.config['model']['num_classes'].get(dataset, 31)
+    
+    def get_domains(self, dataset: str) -> List[str]:
+        """데이터셋별 도메인 목록 반환"""
+        return self.config['datasets'].get(dataset, {}).get('domains', [])
 
-# 3. 모델 생성 (Office-31 호환성 강화)
-def create_model(architecture, num_classes=31):
-    """Office-31 호환 모델 생성 (사전 훈련 가중치 + 채널 최적화)"""
-    print(f"🏗️ 모델 생성 중: {architecture}")
+class ModelManager:
+    """모델 관리 클래스"""
     
-    # 사전 훈련 가중치 사용 여부 확인
-    use_pretrained = config.get('use_pretrained', True)
-    weights = 'IMAGENET1K_V1' if use_pretrained else None
+    def __init__(self, config: SDAUConfig):
+        self.config = config
+        self.device = device
     
-    try:
-        if architecture == 'custom_cnn':
-            model = SimpleCNN(num_classes=num_classes)
-            print("✅ 커스텀 CNN 생성 완료 (3채널 RGB 입력)")
-            return model
-            
-        elif 'resnet' in architecture.lower():
-            # ResNet 계열 모델 생성 (사전 훈련 가중치 사용)
-            if architecture == 'resnet18':
-                model = torchvision.models.resnet18(weights=weights)
-                print(f"📦 ResNet18 로드 (사전훈련: {use_pretrained})")
-            elif architecture == 'resnet50':
-                model = torchvision.models.resnet50(weights=weights)
-                print(f"📦 ResNet50 로드 (사전훈련: {use_pretrained})")
-            else:
-                # 기본값으로 ResNet50 사용
-                model = torchvision.models.resnet50(weights=weights)
-                print(f"📦 알 수 없는 ResNet 변형 {architecture}, ResNet50 사용 (사전훈련: {use_pretrained})")
-            
-            # 🚨 핵심: 첫 번째 convolution은 사전훈련시 이미 3채널이므로 그대로 사용
-            if use_pretrained:
-                print(f"✅ 사전 훈련된 conv1 사용: {model.conv1}")
-            else:
-                # 사전 훈련을 사용하지 않을 때만 수동으로 3채널 설정
-                model.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-                print(f"✅ 새로운 conv1: {model.conv1} (3채널 → 64채널)")
-            
-            # ⚡ 백본 동결 설정 (fine-tuning vs full training)
-            freeze_backbone = config.get('freeze_backbone', False)
-            if freeze_backbone and use_pretrained:
-                for param in model.parameters():
-                    param.requires_grad = False
-                # 분류 레이어만 학습 가능하게 설정
-                model.fc.requires_grad_(True)
-                print("🔒 백본 동결, 분류 레이어만 학습")
-            else:
-                print("🔓 전체 모델 fine-tuning")
-            
-            # 마지막 분류 레이어를 Office-31 클래스 수에 맞게 조정
+    def create_model(self, num_classes: int) -> nn.Module:
+        """모델 생성"""
+        architecture = self.config.get('model', 'architecture')
+        pretrained = self.config.get('model', 'pretrained')
+        
+        if architecture == 'resnet50':
+            from torchvision.models import resnet50, ResNet50_Weights
+            weights = ResNet50_Weights.DEFAULT if pretrained else None
+            model = resnet50(weights=weights)
             model.fc = nn.Linear(model.fc.in_features, num_classes)
-            print(f"✅ 분류 레이어 조정: → {num_classes}개 클래스")
-            
-            return model
-            
-        elif 'vit' in architecture.lower():
-            # Vision Transformer 모델 생성
-            if architecture == 'vit_b_16':
-                model = torchvision.models.vit_b_16(weights=weights)
-                model.heads = nn.Linear(model.heads.head.in_features, num_classes)
-            elif architecture == 'vit_l_16':
-                model = torchvision.models.vit_l_16(weights=weights)
-                model.heads = nn.Linear(model.heads.head.in_features, num_classes)
-            else:
-                model = torchvision.models.vit_b_16(weights=weights)
-                model.heads = nn.Linear(model.heads.head.in_features, num_classes)
-            
-            print(f"✅ ViT 모델 생성 완료 (224x224 3채널 입력, 사전훈련: {use_pretrained})")
-            return model
-            
         else:
-            # 알 수 없는 아키텍처는 ResNet50으로 대체
-            print(f"⚠️ 알 수 없는 아키텍처: {architecture}, ResNet50으로 대체")
-            model = torchvision.models.resnet50(weights=weights)
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
-            print(f"✅ ResNet50 대체 모델 생성 완료 (3채널 RGB 입력, 사전훈련: {use_pretrained})")
-            return model
-            
-    except Exception as e:
-        print(f"❌ 모델 생성 실패: {e}")
-        print("🔄 기본 CNN으로 대체")
-        model = SimpleCNN(num_classes=num_classes)
-        print("✅ 기본 CNN 생성 완료 (3채널 RGB 입력)")
-        return model
-
-# 4. 데이터 로더 (통합된 데이터셋 관리자 사용)
-def get_data_loaders(batch_size, architecture, source_dataset_name='SVHN', target_dataset_name='MNIST'):
-    """통합된 데이터셋 관리자를 사용하는 데이터 로더 생성 (조건부 채널 통일)"""
-    
-    from dataset_manager import dataset_manager
-    
-    print(f"🎯 도메인 적응 설정:")
-    print(f"   📤 소스: {source_dataset_name}")
-    print(f"   📥 타겟: {target_dataset_name}")
-    
-    # 🔧 채널 통일이 필요한 조합 정의
-    channel_unification_needed = [
-        ('SVHN', 'MNIST'),          # 3채널 → 1채널
-        ('MNIST', 'SVHN'),          # 1채널 → 3채널  
-        ('SVHN', 'FashionMNIST'),   # 3채널 → 1채널
-        ('FashionMNIST', 'SVHN'),   # 1채널 → 3채널
-        ('CIFAR10', 'MNIST'),       # 3채널 → 1채널
-        ('MNIST', 'CIFAR10'),       # 1채널 → 3채널
-        ('CIFAR10', 'FashionMNIST'), # 3채널 → 1채널
-        ('FashionMNIST', 'CIFAR10'), # 1채널 → 3채널
-    ]
-    
-    current_combination = (source_dataset_name, target_dataset_name)
-    needs_unification = current_combination in channel_unification_needed
-    
-    try:
-        if needs_unification:
-            print(f"🔧 채널 통일 적용: {source_dataset_name}({dataset_manager.get_dataset_info(source_dataset_name)['channels']}ch) ↔ {target_dataset_name}({dataset_manager.get_dataset_info(target_dataset_name)['channels']}ch)")
-            
-            # 🔄 통일된 도메인 적응 로더 사용
-            source_train_loader, target_train_loader, source_test_loader, target_test_loader = \
-                dataset_manager.load_dataset_for_domain_adaptation(
-                    source_dataset_name, target_dataset_name, 
-                    batch_size=batch_size, shuffle=True
-                )
-        else:
-            print(f"📦 일반 로더 사용: 채널 통일 불필요")
-            
-            # 🔄 일반 데이터셋 로더 사용 (기존 방식)
-            source_train_loader, source_test_loader = dataset_manager.load_dataset(
-                source_dataset_name, batch_size=batch_size, shuffle=True)
-            target_train_loader, target_test_loader = dataset_manager.load_dataset(
-                target_dataset_name, batch_size=batch_size, shuffle=True)
+            raise ValueError(f"지원하지 않는 모델 아키텍처: {architecture}")
         
-        print(f"✅ 데이터 로더 생성 완료!")
-        print(f"   📊 소스 훈련 배치 수: {len(source_train_loader)}")
-        print(f"   📊 타겟 훈련 배치 수: {len(target_train_loader)}")
-        
-        return source_train_loader, target_train_loader, source_test_loader, target_test_loader
-        
-    except Exception as e:
-        print(f"❌ 데이터 로더 생성 실패: {str(e)}")
-        raise
-
-# 5. 모델 저장 함수 (도메인별 구분 저장)
-def save_model(model, filename, additional_info=None, source_domain=None, target_domain=None):
-    """모델과 추가 정보를 도메인별 디렉토리에 저장합니다."""
-    
-    # 도메인 정보 추출 (파라미터 우선, 없으면 config에서)
-    source_dataset = source_domain if source_domain else config.get('source_dataset', 'Unknown')
-    target_dataset = target_domain if target_domain else config.get('target_dataset', 'Unknown')
-    
-    # 도메인 이름 정리 (Office31_Amazon → Amazon)
-    source_name = source_dataset.split('_')[-1] if '_' in source_dataset else source_dataset
-    target_name = target_dataset.split('_')[-1] if '_' in target_dataset else target_dataset
-    
-    # 실험 이름 생성
-    experiment_name = f"{source_name}2{target_name}"
-    
-    # 도메인별 디렉토리 생성
-    domain_dir = f'models/{experiment_name}'
-    os.makedirs(domain_dir, exist_ok=True)
-    
-    # 타임스탬프 추가 (중복 방지)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = filename.replace('.pt', '')
-    timestamped_filename = f"{base_name}_{timestamp}.pt"
-    
-    # 저장할 정보 구성
-    save_dict = {
-        'model_state_dict': model.state_dict(),
-        'config': config,
-        'experiment_name': experiment_name,
-        'source_dataset': source_dataset,
-        'target_dataset': target_dataset,
-        'timestamp': datetime.now().isoformat(),
-        'filename': filename
-    }
-    if additional_info:
-        save_dict.update(additional_info)
-    
-    # 두 가지 방식으로 저장
-    full_path = f'{domain_dir}/{filename}'
-    timestamped_path = f'{domain_dir}/{timestamped_filename}'
-    
-    # 1. 최신 버전 (덮어쓰기)
-    torch.save(save_dict, full_path)
-    
-    # 2. 타임스탬프 버전 (보존용)
-    torch.save(save_dict, timestamped_path)
-    
-    print(f"💾 모델 저장: {full_path}")
-    print(f"💾 백업 저장: {timestamped_path}")
-    
-    return full_path, timestamped_path
-
-# 6. 성능 추적 함수
-def track_performance(epoch, source_acc, target_acc, loss):
-    """성능을 추적하고 최고 성능 모델을 저장합니다."""
-    global best_target_accuracy, performance_history
-    
-    performance_history.append({
-        'epoch': epoch,
-        'source_accuracy': source_acc,
-        'target_accuracy': target_acc,
-        'loss': loss,
-        'timestamp': datetime.now().isoformat()
-    })
-    
-    if target_acc > best_target_accuracy:
-        best_target_accuracy = target_acc
-        return True  # 새로운 최고 성능
-    return False
-
-# 7. 향상된 훈련 함수 (고급 설정 적용)
-def train_model_with_evaluation(model, source_loader, target_loader, num_epochs=3, source_domain=None, target_domain=None):
-    print(f"🏋️ 고성능 모델 훈련 시작 ({num_epochs} 에포크)")
-    
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    
-    # 🔧 고급 옵티마이저 설정
-    learning_rate = config.get('learning_rate', 2e-4)
-    weight_decay = config.get('weight_decay', 1e-4)
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    print(f"⚙️ 옵티마이저: AdamW (lr={learning_rate}, wd={weight_decay})")
-    
-    # 🔥 학습률 스케줄러 설정
-    scheduler_type = config.get('scheduler_type', 'cosine')
-    warmup_epochs = config.get('warmup_epochs', 2)
-    
-    if scheduler_type == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-        print("📈 코사인 어닐링 스케줄러 사용")
-    elif scheduler_type == 'step':
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=num_epochs//3, gamma=0.1)
-        print("📉 스텝 스케줄러 사용")
-    else:
-        scheduler = None
-        print("📊 고정 학습률 사용")
-    
-    # 🎯 그래디언트 클리핑 설정
-    gradient_clip = config.get('gradient_clip', 1.0)
-    print(f"✂️ 그래디언트 클리핑: {gradient_clip}")
-    
-    losses = []
-    
-    for epoch in range(num_epochs):
-        epoch_loss = 0.0
-        batch_count = 0
-        
-        # 워밍업 학습률 조정
-        if epoch < warmup_epochs and scheduler is not None:
-            warmup_lr = learning_rate * (epoch + 1) / warmup_epochs
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = warmup_lr
-            print(f"🔥 워밍업 학습률: {warmup_lr:.6f}")
-        
-        pbar = tqdm(source_loader, desc=f"에포크 {epoch+1}/{num_epochs}")
-        
-        for batch_idx, (data, target) in enumerate(pbar):
-            data, target = data.to(device), target.to(device)
-            
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            
-            # 🎯 그래디언트 클리핑 적용
-            if gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-            
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            batch_count += 1
-            
-            # 현재 학습률 표시
-            current_lr = optimizer.param_groups[0]['lr']
-            pbar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
-                'LR': f'{current_lr:.6f}'
-            })
-            
-            # 빠른 테스트 모드 (설정에서 제어)
-            if config.get('quick_test', False) and batch_count >= 30:
-                break
-        
-        avg_loss = epoch_loss / batch_count
-        losses.append(avg_loss)
-        
-        # 학습률 스케줄러 업데이트 (워밍업 이후)
-        if epoch >= warmup_epochs and scheduler is not None:
-            scheduler.step()
-            print(f"📊 학습률 업데이트: {optimizer.param_groups[0]['lr']:.6f}")
-        
-        # 중간 평가 (동적 데이터셋 이름 표시)
-        print(f"\n📊 에포크 {epoch+1} 중간 평가:")
-        source_dataset_name = source_domain if source_domain else 'Unknown'
-        target_dataset_name = target_domain if target_domain else 'Unknown'
-        source_acc = evaluate_model(model, source_loader, max_batches=15, domain_name=f"소스({source_dataset_name})")
-        target_acc = evaluate_model(model, target_loader, max_batches=15, domain_name=f"타겟({target_dataset_name})")
-        
-        # 성능 추적 및 최고 성능 모델 저장
-        is_best = track_performance(epoch+1, source_acc, target_acc, avg_loss)
-        if is_best:
-            save_model(model, 'best_model.pt', {
-                'epoch': epoch+1,
-                'source_accuracy': source_acc,
-                'target_accuracy': target_acc,
-                'loss': avg_loss,
-                'learning_rate': optimizer.param_groups[0]['lr']
-            }, source_domain=source_domain, target_domain=target_domain)
-            print(f"🏆 새로운 최고 성능! 타겟 정확도: {target_acc:.2f}%")
-        
-        print(f"에포크 {epoch+1} 완료, 평균 손실: {avg_loss:.4f}")
-    
-    # 소스 모델 저장
-    save_model(model, 'source_model.pt', {
-        'final_source_accuracy': source_acc,
-        'final_target_accuracy': target_acc,
-        'training_losses': losses,
-        'final_learning_rate': optimizer.param_groups[0]['lr']
-    }, source_domain=source_domain, target_domain=target_domain)
-    
-    print(f"✅ 훈련 완료! 최종 학습률: {optimizer.param_groups[0]['lr']:.6f}")
-    return losses
-
-# 8. 향상된 영향도 계산 (논문 공식 기반) - 안전 장치 추가
-def compute_influence_scores_enhanced(model, source_loader, target_batch, num_samples=300):
-    print("🔍 향상된 영향도 점수 계산 중... (Pseudo-label 사용)")
-    
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-    
-    target_data, _ = target_batch  # ❌ 실제 라벨 무시 (Unsupervised)
-    target_data = target_data.to(device)
-    
-    # 🎯 Pseudo-label 생성 (실제 라벨 대신 사용)
-    with torch.no_grad():
-        target_output = model(target_data)
-        target_pseudo_labels = torch.argmax(target_output, dim=1)
-        confidence_scores = torch.max(torch.softmax(target_output, dim=1), dim=1)[0]
-    
-    print(f"🎯 Pseudo-label 생성 완료: 평균 확신도 {confidence_scores.mean().item():.3f}")
-    
-    # 🚨 클래스 인덱스 안전 검증 추가
-    num_classes = model.fc.out_features if hasattr(model, 'fc') else model.classifier[-1].out_features
-    print(f"📊 모델 클래스 수: {num_classes}")
-    print(f"🎯 Pseudo-label 범위: {target_pseudo_labels.min().item()} ~ {target_pseudo_labels.max().item()}")
-    
-    # 라벨 범위 검증 (Pseudo-label은 이미 모델 출력이므로 안전해야 함)
-    if target_pseudo_labels.max().item() >= num_classes or target_pseudo_labels.min().item() < 0:
-        print(f"❌ Pseudo-label 범위 오류! 범위: [{target_pseudo_labels.min().item()}, {target_pseudo_labels.max().item()}]")
-        target_pseudo_labels = torch.clamp(target_pseudo_labels, 0, num_classes - 1)
-        print(f"✅ 수정된 Pseudo-label 범위: {target_pseudo_labels.min().item()} ~ {target_pseudo_labels.max().item()}")
-    
-    # 타겟 배치 그래디언트 계산 (Pseudo-label 사용)
-    model.zero_grad()
-    target_output = model(target_data)
-    target_loss = criterion(target_output, target_pseudo_labels)  # ✅ Pseudo-label 사용
-    target_loss.backward()
-    
-    target_grads = []
-    for param in model.parameters():
-        if param.grad is not None:
-            target_grads.append(param.grad.data.flatten())
-    target_grad = torch.cat(target_grads) if target_grads else torch.zeros(1).to(device)
-    
-    # 헤시안 근사 (단순화된 버전)
-    hessian_inv_approx = 1.0  # 실제로는 더 복잡한 계산이 필요
-    
-    influence_scores = []
-    sample_count = 0
-    invalid_samples = 0
-    
-    print(f"🎯 {num_samples}개 샘플의 영향도 계산...")
-    
-    for batch_idx, (data, labels) in enumerate(source_loader):
-        if sample_count >= num_samples:
-            break
-            
-        data, labels = data.to(device), labels.to(device)
-        
-        # 🚨 소스 라벨 범위 검증 및 수정
-        original_labels = labels.clone()
-        labels = torch.clamp(labels, 0, num_classes - 1)
-        
-        # 수정된 라벨 수 카운트
-        modified_count = (original_labels != labels).sum().item()
-        if modified_count > 0:
-            invalid_samples += modified_count
-        
-        for i in range(min(len(data), num_samples - sample_count)):
-            try:
-                model.zero_grad()
-                output = model(data[i:i+1])
-                
-                # 추가 안전 검증
-                if labels[i] >= num_classes or labels[i] < 0:
-                    print(f"⚠️ 건너뛰는 샘플: 라벨 {labels[i].item()}, 클래스 수 {num_classes}")
-                    continue
-                
-                loss = criterion(output, labels[i:i+1])
-                loss.backward()
-                
-                sample_grads = []
-                for param in model.parameters():
-                    if param.grad is not None:
-                        sample_grads.append(param.grad.data.flatten())
-                sample_grad = torch.cat(sample_grads) if sample_grads else torch.zeros(1).to(device)
-                
-                # 논문 공식: I_up(z_i, D_T^batch) = -∇_θ L(D_T^batch, θ)^T H_θ^(-1) ∇_θ L(z_i, θ)
-                influence = -torch.dot(target_grad, sample_grad).item() * hessian_inv_approx
-                influence_scores.append(influence)
-                sample_count += 1
-                
-            except RuntimeError as e:
-                if "assert" in str(e).lower() or "index" in str(e).lower():
-                    print(f"⚠️ 샘플 건너뛰기 (라벨 오류): {e}")
-                    invalid_samples += 1
-                    continue
-                else:
-                    raise e
-        
-        if sample_count >= num_samples:
-            break
-    
-    if invalid_samples > 0:
-        print(f"⚠️ 수정/건너뛴 샘플: {invalid_samples}개")
-    
-    print(f"✅ {len(influence_scores)}개 샘플 영향도 계산 완료 (Pseudo-label 기반)")
-    return influence_scores
-
-# 9. 하이브리드 스코어링 (논문 구현)
-def unsupervised_target_sample_selection(model, target_loader, num_samples=800):
-    """타겟 라벨을 모른다고 가정하고 불확실성 기반으로 타겟 샘플 선별"""
-    print(f"🎯 1단계: 불확실성 기반 타겟 샘플 선별 ({num_samples}개)")
-    
-    model.eval()
-    uncertainty_scores = []
-    all_samples = []
-    
-    with torch.no_grad():
-        for batch_idx, batch_data in enumerate(target_loader):
-            # 배치 데이터 처리 (라벨 유무에 관계없이)
-            if len(batch_data) == 2:
-                data, labels = batch_data
-            else:
-                data = batch_data
-                labels = None
-            
-            data = data.to(device)
-            output = model(data)
-            probs = torch.softmax(output, dim=1)
-            
-            # 불확실성 계산 (엔트로피)
-            for i in range(data.size(0)):
-                sample_probs = probs[i]
-                entropy = -torch.sum(sample_probs * torch.log(sample_probs + 1e-8)).item()
-                
-                uncertainty_scores.append(entropy)
-                if labels is not None:
-                    all_samples.append((data[i].cpu(), labels[i].cpu()))
-                else:
-                    all_samples.append((data[i].cpu(), torch.tensor(0)))  # 더미 라벨
-    
-    # 불확실성이 높은 순으로 정렬하여 상위 num_samples개 선택
-    sorted_indices = sorted(range(len(uncertainty_scores)), 
-                           key=lambda i: uncertainty_scores[i], reverse=True)
-    
-    selected_samples = [all_samples[i] for i in sorted_indices[:num_samples]]
-    selected_scores = [uncertainty_scores[i] for i in sorted_indices[:num_samples]]
-    
-    print(f"✅ 불확실성 기반 타겟 샘플 선별 완료: {len(selected_samples)}개")
-    print(f"📊 평균 불확실성: {np.mean(selected_scores):.4f}")
-    
-    return selected_samples, selected_scores
-
-def compute_influence_and_select_harmful(model, source_loader, target_samples, num_harmful=50):
-    """선별된 타겟 샘플과 비교하여 유해한 소스 샘플 선별"""
-    print(f"🎯 2단계: 유해 소스 샘플 선별 ({num_harmful}개)")
-    
-    # 타겟 샘플들에 대한 영향도 계산
-    target_batch_for_influence = []
-    for i, (data, label) in enumerate(target_samples[:100]):  # 처음 100개만 사용
-        target_batch_for_influence.append((data, label))
-    
-    # 영향도 점수 계산
-    influence_scores = compute_influence_scores_enhanced(
-        model, source_loader, target_batch_for_influence, num_samples=500)
-    
-    # 영향도가 가장 높은 (유해한) 소스 샘플들 선별
-    harmful_indices = sorted(range(len(influence_scores)), 
-                           key=lambda i: abs(influence_scores[i]), reverse=True)[:num_harmful]
-    
-    # 유해한 소스 샘플들 수집
-    harmful_samples = []
-    harmful_scores = []
-    
-    sample_count = 0
-    for batch_idx, (data, labels) in enumerate(source_loader):
-        for i in range(data.size(0)):
-            if sample_count in harmful_indices:
-                harmful_samples.append((data[i].cpu(), labels[i].cpu()))
-                harmful_scores.append(influence_scores[sample_count])
-            sample_count += 1
-            
-            if len(harmful_samples) >= num_harmful:
-                break
-        if len(harmful_samples) >= num_harmful:
-            break
-    
-    print(f"✅ 유해 소스 샘플 선별 완료: {len(harmful_samples)}개")
-    print(f"📊 평균 영향도: {np.mean([abs(s) for s in harmful_scores]):.4f}")
-    
-    return harmful_samples, harmful_scores
-
-def compute_hybrid_scores(model, target_samples, influence_scores, lambda_u=0.6, beta=0.1):
-    """논문의 하이브리드 스코어링: S(x) = λ_u·I(x;θ') + (1-λ_u)·div(x, D_T^sub) + β·H(x)"""
-    print("🎯 하이브리드 스코어 계산 중...")
-    
-    model.eval()
-    hybrid_scores = []
-    
-    with torch.no_grad():
-        for i, sample in enumerate(target_samples):
-            if i >= len(influence_scores):
-                break
-                
-            # 샘플 데이터 처리 - 유연한 언패킹
-            if isinstance(sample, (tuple, list)) and len(sample) >= 2:
-                data, _ = sample[0], sample[1]
-            else:
-                data = sample
-            
-            # 데이터를 디바이스로 이동하고 배치 차원 추가
-            data = data.to(device)
-            if len(data.shape) == 3:  # [C, H, W] -> [1, C, H, W]
-                data = data.unsqueeze(0)
-            
-            output = model(data)
-            probs = torch.softmax(output, dim=1)
-            
-            # 1. 영향도 스코어 (정규화)
-            influence_score = influence_scores[i]
-            
-            # 2. 다양성 스코어 (단순화된 버전)
-            diversity_score = torch.max(probs).item()  # 최대 확률의 역수로 근사
-            
-            # 3. 불확실성 스코어 (엔트로피)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8)).item()
-            
-            # 하이브리드 스코어 계산
-            hybrid_score = (lambda_u * influence_score + 
-                          (1 - lambda_u) * (1 - diversity_score) + 
-                          beta * entropy)
-            
-            hybrid_scores.append(hybrid_score)
-    
-    print(f"✅ {len(hybrid_scores)}개 하이브리드 스코어 계산 완료")
-    return hybrid_scores
-
-# 10. 향상된 언러닝 (DOS 알고리즘) - BatchNorm 안전 버전
-def perform_dos_unlearning(model, harmful_data, influence_scores, num_steps=5):
-    print("🔄 DOS (Dynamic Orthogonal Scaling) 언러닝 수행 중...")
-    
-    # BatchNorm 문제 해결: 훈련 모드 유지하되 배치 크기 조정
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    
-    # 동적 가중치 계산 (영향도에 비례)
-    abs_scores = [abs(s) for s in influence_scores]
-    max_abs = max(abs_scores) if abs_scores else 1.0
-    weights = [s / max_abs for s in abs_scores]  # 정규화된 가중치
-    
-    unlearn_losses = []
-    
-    # BatchNorm 안정성을 위한 최소 배치 크기 보장
-    min_batch_size = 2  # BatchNorm이 안정적으로 작동하는 최소 크기
-    effective_batch_size = max(min_batch_size, min(8, len(harmful_data)))
-    
-    for step in range(num_steps):
-        total_loss = 0.0
-        processed_batches = 0
-        
-        # 데이터를 배치로 그룹핑
-        for batch_start in range(0, len(harmful_data), effective_batch_size):
-            batch_end = min(batch_start + effective_batch_size, len(harmful_data))
-            
-            # 배치가 너무 작으면 건너뛰기 (BatchNorm 안정성)
-            if batch_end - batch_start < min_batch_size:
-                continue
-            
-            batch_data = []
-            batch_labels = []
-            batch_weights = []
-            
-            # 배치 데이터 준비
-            for i in range(batch_start, batch_end):
-                if i >= len(harmful_data) or i >= len(weights):
-                    break
-                    
-                data, label = harmful_data[i]
-                
-                # 데이터 타입 확인 및 변환
-                data = data.to(device)
-                if isinstance(label, int):
-                    label = torch.tensor(label).to(device)
-                else:
-                    label = label.to(device)
-                
-                batch_data.append(data)
-                batch_labels.append(label)
-                batch_weights.append(abs(weights[i]))
-            
-            if len(batch_data) < min_batch_size:
-                continue
-                
-            # 배치 텐서 생성
-            batch_data_tensor = torch.stack(batch_data)
-            batch_labels_tensor = torch.stack(batch_labels)
-            batch_weights_tensor = torch.tensor(batch_weights, device=device)
-            
-            optimizer.zero_grad()
-            
-            # 순전파 (BatchNorm이 안전하게 작동)
-            output = model(batch_data_tensor)
-            
-            # 개별 샘플 손실 계산 후 가중치 적용
-            batch_loss = 0.0
-            for j in range(len(batch_data_tensor)):
-                sample_loss = criterion(output[j:j+1], batch_labels_tensor[j:j+1])
-                weighted_sample_loss = sample_loss * batch_weights_tensor[j]
-                batch_loss += weighted_sample_loss
-            
-            # 배치 평균 손실
-            avg_batch_loss = batch_loss / len(batch_data_tensor)
-            
-            # 언러닝을 위한 그래디언트 반전 (음의 그래디언트)
-            (-avg_batch_loss).backward()
-            optimizer.step()
-            
-            total_loss += avg_batch_loss.item()
-            processed_batches += 1
-        
-        avg_loss = total_loss / max(1, processed_batches)
-        unlearn_losses.append(avg_loss)
-        
-        if (step + 1) % 2 == 0:
-            print(f"  DOS 스텝 {step + 1}/{num_steps}, 가중 손실: {avg_loss:.4f}")
-    
-    print("✅ DOS 언러닝 완료")
-    return unlearn_losses
-
-# 11. 타겟 도메인 재학습 (Self-training)
-def retrain_with_curated_target_samples(model, curated_samples, adaptation_epochs=5):
-    """큐레이션된 타겟 샘플로 Fine-tuning 수행 (실제 라벨 사용)"""
-    print(f"🎓 4단계: 선별된 타겟 샘플로 Fine-tuning ({adaptation_epochs}에포크)")
-    print("📋 중요: 이 단계에서는 실제 타겟 라벨을 사용합니다!")
-    
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    
-    for epoch in range(adaptation_epochs):
-        total_loss = 0.0
-        correct_predictions = 0
-        total_samples = 0
-        
-        # 배치 단위로 처리
-        batch_size = 16
-        for i in range(0, len(curated_samples), batch_size):
-            batch_end = min(i + batch_size, len(curated_samples))
-            batch_data = []
-            batch_labels = []
-            
-            for j in range(i, batch_end):
-                data, label = curated_samples[j]  # ✅ 실제 라벨 사용 (Fine-tuning용)
-                batch_data.append(data)
-                batch_labels.append(label)
-            
-            if len(batch_data) == 0:
-                continue
-                
-            batch_tensor = torch.stack(batch_data).to(device)
-            batch_labels_tensor = torch.stack(batch_labels).to(device)
-            
-            # 🚨 클래스 수 안전 검증
-            num_classes = model.fc.out_features if hasattr(model, 'fc') else model.classifier[-1].out_features
-            batch_labels_tensor = torch.clamp(batch_labels_tensor, 0, num_classes - 1)
-            
-            total_samples += len(batch_data)
-            
-            # 실제 라벨로 Fine-tuning
-            optimizer.zero_grad()
-            output = model(batch_tensor)
-            loss = criterion(output, batch_labels_tensor)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            
-            # 정확도 계산
-            _, predicted = torch.max(output.data, 1)
-            correct_predictions += (predicted == batch_labels_tensor).sum().item()
-        
-        avg_loss = total_loss / max(1, total_samples // batch_size)
-        accuracy = correct_predictions / max(1, total_samples) * 100
-        
-        if (epoch + 1) % 2 == 0:
-            print(f"  에포크 {epoch+1}/{adaptation_epochs}: "
-                  f"손실={avg_loss:.4f}, "
-                  f"정확도={accuracy:.1f}% ({correct_predictions}/{total_samples})")
-    
-    print(f"✅ 타겟 도메인 Fine-tuning 완료 (최종 정확도: {accuracy:.1f}%)")
-
-# 12. 향상된 평가 함수
-def evaluate_model(model, data_loader, max_batches=20, domain_name=""):
-    model.eval()
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for batch_idx, (data, target) in enumerate(data_loader):
-            if batch_idx >= max_batches:
-                break
-                
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            _, predicted = torch.max(output.data, 1)
-            total += target.size(0)
-            correct += (predicted == target).sum().item()
-    
-    accuracy = 100 * correct / total
-    print(f"📊 {domain_name} 정확도: {accuracy:.2f}% ({correct}/{total})")
-    return accuracy
-
-# 12. 결과 저장 및 분석
-def save_comprehensive_results(results):
-    """포괄적인 결과를 저장합니다."""
-    
-    # JSON 결과 저장
-    with open('results/sda_u_comprehensive_results.json', 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    
-    # 성능 히스토리 저장
-    with open('results/performance_history.json', 'w', encoding='utf-8') as f:
-        json.dump(performance_history, f, indent=2, ensure_ascii=False)
-    
-    print("💾 포괄적인 결과 저장 완료")
-
-# 13. 통합된 데이터 로딩 함수
-def load_data(args):
-    """통합된 데이터 로딩 함수 (Office-Home, Office-31, CIFAR 등 지원)"""
-    
-    print(f"📦 데이터 로딩 중...")
-    print(f"🎯 데이터셋: {args.dataset}")
-    
-    if args.dataset == 'Office31':
-        from office31_loader import Office31Loader
-        loader = Office31Loader()
-        
-        print(f"📤 소스 도메인: {args.source_domain}")
-        print(f"📥 타겟 도메인: {args.target_domain}")
-        
-        # 도메인별 데이터 로드
-        source_train_dataset, source_test_dataset = loader.load_domain_data(args.source_domain)
-        target_train_dataset, target_test_dataset = loader.load_domain_data(args.target_domain)
-        
-        # 데이터 로더 생성
-        source_train_loader = DataLoader(source_train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-        source_test_loader = DataLoader(source_test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-        target_train_loader = DataLoader(target_train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-        target_test_loader = DataLoader(target_test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-        
-        num_classes = 31  # Office-31 클래스 수
-        
-    elif args.dataset == 'OfficeHome':
-        from officehome_loader import OfficeHomeLoader
-        loader = OfficeHomeLoader()
-        
-        print(f"📤 소스 도메인: {args.source_domain}")
-        print(f"📥 타겟 도메인: {args.target_domain}")
-        
-        # 도메인별 데이터 로드
-        source_train_dataset, source_test_dataset = loader.load_domain_data(args.source_domain)
-        target_train_dataset, target_test_dataset = loader.load_domain_data(args.target_domain)
-        
-        # 데이터 로더 생성
-        source_train_loader = DataLoader(source_train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-        source_test_loader = DataLoader(source_test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-        target_train_loader = DataLoader(target_train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-        target_test_loader = DataLoader(target_test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-        
-        num_classes = 65  # Office-Home 클래스 수
-        
-    else:
-        # 기타 데이터셋 (SVHN, MNIST, CIFAR 등)
-        from dataset_manager import DatasetManager
-        manager = DatasetManager()
-        
-        # source_domain과 target_domain을 데이터셋 이름으로 사용
-        source_dataset_name = args.source_domain
-        target_dataset_name = args.target_domain
-        
-        print(f"📤 소스 데이터셋: {source_dataset_name}")
-        print(f"📥 타겟 데이터셋: {target_dataset_name}")
-        
-        # 데이터셋 정보 가져오기
-        source_info = manager.get_dataset_info(source_dataset_name)
-        target_info = manager.get_dataset_info(target_dataset_name)
-        
-        print(f"📊 소스 클래스: {source_info['num_classes']}개")
-        print(f"📊 타겟 클래스: {target_info['num_classes']}개")
-        
-        # 🚨 CIFAR 특별 처리: 클래스 수 불일치 해결
-        if (source_dataset_name == 'CIFAR10' and target_dataset_name == 'CIFAR100') or \
-           (source_dataset_name == 'CIFAR100' and target_dataset_name == 'CIFAR10'):
-            
-            print("🔧 CIFAR10↔CIFAR100 클래스 수 불일치 감지 - 특별 처리 모드")
-            num_classes = 10  # CIFAR10 기준으로 통일
-            print(f"✅ 클래스 수를 CIFAR10 기준(10개)으로 통일")
-            print(f"⚠️ CIFAR100 라벨은 0-9 범위로 자동 클리핑됩니다")
-            
-        else:
-            # 일반적인 경우: 더 작은 클래스 수 사용
-            num_classes = min(source_info['num_classes'], target_info['num_classes'])
-            print(f"🔧 통일된 클래스 수: {num_classes}개")
-        
-        # 데이터셋 로드
-        source_train_loader, source_test_loader = manager.load_dataset(source_dataset_name, args.batch_size)
-        target_train_loader, target_test_loader = manager.load_dataset(target_dataset_name, args.batch_size)
-    
-    print(f"✅ 데이터 로딩 완료! (클래스 수: {num_classes})")
-    return source_train_loader, source_test_loader, target_train_loader, target_test_loader, num_classes
-
-# 14. 메인 실행 함수
-def main():
-    """메인 실행 함수"""
-    
-    parser = argparse.ArgumentParser(description='SDA-U (Selective Domain Adaptation with Unlearning)')
-    
-    # 데이터셋 설정
-    parser.add_argument('--dataset', type=str, default='Office31', 
-                       choices=['Office31', 'OfficeHome', 'SVHN', 'MNIST', 'FashionMNIST', 'CIFAR10', 'CIFAR100', 'STL10'],
-                       help='데이터셋 선택')
-    parser.add_argument('--source_domain', type=str, required=True,
-                       help='소스 도메인 (Office31: amazon/webcam/dslr, OfficeHome: art/clipart/product/real_world)')
-    parser.add_argument('--target_domain', type=str, required=True, 
-                       help='타겟 도메인 (Office31: amazon/webcam/dslr, OfficeHome: art/clipart/product/real_world)')
-    
-    # 훈련 파라미터
-    parser.add_argument('--batch_size', type=int, default=32, help='배치 크기')
-    parser.add_argument('--num_epochs', type=int, default=20, help='훈련 에포크')
-    parser.add_argument('--learning_rate', type=float, default=2e-4, help='학습률')
-    parser.add_argument('--architecture', type=str, default='resnet50', 
-                       choices=['resnet18', 'resnet50', 'simple_cnn'], help='모델 아키텍처')
-    
-    # SDA-U 파라미터
-    parser.add_argument('--influence_samples', type=int, default=500, help='영향도 계산 샘플 수')
-    parser.add_argument('--target_samples', type=int, default=800, help='타겟 샘플 수')
-    parser.add_argument('--unlearn_steps', type=int, default=8, help='언러닝 스텝 수')
-    parser.add_argument('--lambda_u', type=float, default=0.6, help='하이브리드 스코어링 λ_u')
-    parser.add_argument('--beta', type=float, default=0.1, help='하이브리드 스코어링 β')
-    parser.add_argument('--adaptation_epochs', type=int, default=10, help='적응 훈련 에포크')
-    
-    # 저장 경로 파라미터
-    parser.add_argument('--model_save_dir', type=str, default='models', help='모델 저장 디렉토리')
-    parser.add_argument('--results_file', type=str, default='results/sda_u_comprehensive_results.json', help='결과 파일 경로')
-    
-    # 🚀 사전 훈련 모델 관련 옵션
-    parser.add_argument('--pretrained_model', type=str, default=None, 
-                       help='사전 훈련된 모델 경로 (있으면 소스 도메인 훈련 스킵)')
-    parser.add_argument('--skip_source_training', action='store_true', 
-                       help='소스 도메인 훈련 스킵 (사전 훈련된 가중치 사용)')
-    parser.add_argument('--use_pretrained_weights', action='store_true', default=True,
-                       help='ImageNet 사전 훈련 가중치 사용')
-    
-    args = parser.parse_args()
-
-    # GPU 설정 및 최적화
-    try:
-        from gpu_config import setup_gpu_optimizations, get_gpu_info
-        print("🚀 A100 최적화 활성화!")
-        setup_gpu_optimizations()
-        gpu_info = get_gpu_info()
-        print(f"🚀 설정 로드 완료: {gpu_info['name']}")
-    except ImportError:
-        print("⚠️ GPU 최적화 설정 파일이 없습니다. 기본 설정 사용")
-        
-    global device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🔧 사용 디바이스: {device}")
-
-    # 데이터 로딩
-    source_train_loader, source_test_loader, target_train_loader, target_test_loader, num_classes = load_data(args)
-    
-    # 모델 생성
-    model = create_model(args.architecture, num_classes).to(device)
-    
-    print(f"🤖 모델 생성 완료: {args.architecture} (클래스: {num_classes})")
-    print(f"📊 파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
-
-    # 전체 SDA-U 실행
-    print("\n" + "="*80)
-    print("🚀 SDA-U 프레임워크 실행!")
-    print("="*80)
-    
-    try:
-        # 🚀 사전 훈련된 모델 로드 또는 소스 도메인 훈련
-        if args.pretrained_model and os.path.exists(args.pretrained_model):
-            print(f"📦 사전 훈련된 모델 로드: {args.pretrained_model}")
-            checkpoint = torch.load(args.pretrained_model, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print("✅ 사전 훈련된 모델 로드 완료!")
-            
-        elif args.skip_source_training:
-            print("⏭️ 소스 도메인 훈련 스킵 - ImageNet 사전 훈련 가중치만 사용")
-            print("💡 이 모드에서는 ResNet 등의 ImageNet 사전 훈련 가중치를 그대로 사용합니다")
-            
-        else:
-            # 1. 소스 도메인 사전 훈련
-            print("📚 1단계: 소스 도메인 사전 훈련")
-            train_model_with_evaluation(model, source_train_loader, source_test_loader, num_epochs=args.num_epochs, 
-                                      source_domain=args.source_domain, target_domain=args.target_domain)
-        
-        # 2. 타겟 도메인 평가 (사전 훈련 후)
-        print("\n📊 2단계: 타겟 도메인 초기 평가")
-        initial_target_acc = evaluate_model(model, target_test_loader, domain_name="타겟(초기)")
-        
-        # 소스 도메인 초기 성능도 측정 (참고용)
-        initial_source_acc = evaluate_model(model, source_test_loader, domain_name="소스(초기)")
-        print(f"📊 소스 도메인 초기 성능: {initial_source_acc:.2f}%")
-        
-        # 3. 올바른 SDA-U 알고리즘 수행
-        print("\n🎯 SDA-U 알고리즘 시작 (올바른 순서)")
-        
-        # 3-1. 타겟 샘플 선별 (라벨 없이)
-        curated_samples, uncertainty_scores = unsupervised_target_sample_selection(
-            model, target_train_loader, num_samples=args.target_samples)
-        
-        # 3-2. 유해한 소스 샘플 선별
-        harmful_samples, harmful_scores = compute_influence_and_select_harmful(
-            model, source_train_loader, curated_samples, num_harmful=50)
-        
-        # 3-3. 머신 언러닝 수행
-        print("\n🔄 3단계: 머신 언러닝 수행")
-        unlearn_losses = perform_dos_unlearning(
-            model, harmful_samples, harmful_scores, 
-            num_steps=args.unlearn_steps)
-        
-        # 3-4. 선별된 타겟 샘플로 Fine-tuning
-        retrain_with_curated_target_samples(model, curated_samples, args.adaptation_epochs)
-        
-        # 4. 최종 평가
-        print("\n📈 4단계: 최종 성능 평가")
-        final_source_acc = evaluate_model(model, source_test_loader, domain_name="소스(최종)")
-        final_target_acc = evaluate_model(model, target_test_loader, domain_name="타겟(최종)")
-        
-        # 5. 결과 저장
-        print("\n💾 5단계: 결과 저장")
-        results = {
-            'experiment_info': {
-                'dataset': args.dataset,
-                'source_domain': args.source_domain,
-                'target_domain': args.target_domain,
-                'architecture': args.architecture,
-                'num_classes': num_classes
-            },
-            'performance': {
-                'initial_source_accuracy': initial_source_acc,
-                'initial_target_accuracy': initial_target_acc,
-                'final_source_accuracy': final_source_acc,
-                'final_target_accuracy': final_target_acc,
-                'target_improvement': final_target_acc - initial_target_acc,
-                'source_change': final_source_acc - initial_source_acc
-            },
-            'sda_u_metrics': {
-                'harmful_samples': len(harmful_samples),
-                'curated_samples': len(curated_samples),
-                'unlearn_steps': args.unlearn_steps,
-                'unlearn_losses': unlearn_losses
-            },
-            'hyperparameters': {
-                'batch_size': args.batch_size,
-                'learning_rate': args.learning_rate,
-                'lambda_u': args.lambda_u,
-                'beta': args.beta
-            }
-        }
-        
-        # 결과 저장 (지정된 경로 사용)
-        results_dir = os.path.dirname(args.results_file)
-        os.makedirs(results_dir, exist_ok=True)
-        
-        # 결과를 지정된 파일에 저장
-        with open(args.results_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"💾 결과 저장 완료: {args.results_file}")
-        
-        # 모델 저장 (지정된 경로 사용)
-        model_dir = os.path.dirname(args.model_save_dir)
-        os.makedirs(model_dir, exist_ok=True)
-        model_filename = f"{args.source_domain}2{args.target_domain}_sda_u_model.pt"
-        model_path = os.path.join(args.model_save_dir, model_filename)
+        return model.to(self.device)
+    
+    def save_model(self, model: nn.Module, save_path: str, metadata: Dict = None):
+        """모델 저장"""
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
         save_dict = {
             'model_state_dict': model.state_dict(),
-            'results': results,
-            'args': vars(args)
+            'config': self.config.config,
+            'timestamp': time.time()
         }
-        torch.save(save_dict, model_path)
-        print(f"🤖 모델 저장 완료: {model_path}")
         
-        print("\n🎉 SDA-U 실험 완료!")
-        print(f"📊 타겟 정확도 향상: {initial_target_acc:.2f}% → {final_target_acc:.2f}% (+{final_target_acc-initial_target_acc:.2f}%)")
-        print(f"📊 소스 정확도 변화: {initial_source_acc:.2f}% → {final_source_acc:.2f}% ({final_source_acc-initial_source_acc:+.2f}%)")
+        if metadata:
+            save_dict.update(metadata)
         
-        # 성능 요약
-        if final_target_acc > initial_target_acc:
-            print("✅ 타겟 도메인 성능 향상 성공!")
+        torch.save(save_dict, save_path)
+        flush_print(f"💾 모델 저장 완료: {save_path}")
+    
+    def load_model(self, model: nn.Module, load_path: str) -> Dict:
+        """모델 로딩"""
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {load_path}")
+        
+        checkpoint = torch.load(load_path, map_location=self.device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        flush_print(f"📥 모델 로딩 완료: {load_path}")
+        return checkpoint
+
+class DataManager:
+    """데이터 관리 클래스"""
+    
+    def __init__(self, config: SDAUConfig):
+        self.config = config
+        self.data_root = self.config.get('paths', 'data_root')
+    
+    def load_dataset(self, dataset: str, source_domain: str, target_domain: str, 
+                    batch_size: int) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader, int]:
+        """데이터셋 로딩"""
+        if dataset == 'Office31':
+            return self._load_office31(source_domain, target_domain, batch_size)
+        elif dataset == 'OfficeHome':
+            return self._load_officehome(source_domain, target_domain, batch_size)
         else:
-            print("❌ 타겟 도메인 성능 향상 실패")
+            raise ValueError(f"지원하지 않는 데이터셋: {dataset}")
+    
+    def _load_office31(self, source_domain: str, target_domain: str, 
+                      batch_size: int) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader, int]:
+        """Office31 데이터셋 로딩"""
+        manager = Office31Manager(root=self.data_root)
+        
+        source_train_dataset, source_test_dataset = manager.load_domain_data(source_domain)
+        target_train_dataset, target_test_dataset = manager.load_domain_data(target_domain)
+        
+        source_train_loader = DataLoader(source_train_dataset, batch_size=batch_size, shuffle=True)
+        source_test_loader = DataLoader(source_test_dataset, batch_size=batch_size, shuffle=False)
+        target_train_loader = DataLoader(target_train_dataset, batch_size=batch_size, shuffle=True)
+        target_test_loader = DataLoader(target_test_dataset, batch_size=batch_size, shuffle=False)
+        
+        return source_train_loader, source_test_loader, target_train_loader, target_test_loader, 31
+    
+    def _load_officehome(self, source_domain: str, target_domain: str, 
+                        batch_size: int) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader, int]:
+        """OfficeHome 데이터셋 로딩"""
+        loader = OfficeHomeLoader(root=self.data_root)
+        
+        # OfficeHome 로더가 이제 DataLoader를 직접 반환 (collate_fn 포함)
+        source_train_loader, source_test_loader = loader.load_domain_data(source_domain, batch_size)
+        target_train_loader, target_test_loader = loader.load_domain_data(target_domain, batch_size)
+        
+        return source_train_loader, source_test_loader, target_train_loader, target_test_loader, 65
+
+class TargetSampleSelector:
+    """타겟 샘플 선별 클래스 - AlignSet + 능동학습 하이브리드 방법"""
+    
+    def __init__(self, config: SDAUConfig):
+        self.config = config
+    
+    def select_samples(self, model: nn.Module, target_train_loader: DataLoader, 
+                      num_classes: int) -> List[Tuple]:
+        """타겟 샘플 선별 - AlignSet + 능동학습 하이브리드 스코어링"""
+        method = self.config.get('target_selection', 'selection_method')
+        
+        if method == 'hybrid_alignset_active':
+            return self._select_hybrid_alignset_active(model, target_train_loader)
+        elif method == 'random':
+            return self._select_random(target_train_loader)
+        else:
+            raise ValueError(f"지원하지 않는 선별 방법: {method}")
+    
+    def _select_hybrid_alignset_active(self, model: nn.Module, target_train_loader: DataLoader) -> List[Tuple]:
+        """AlignSet + 능동학습 하이브리드 스코어링 기반 선별"""
+        num_samples = self.config.get('target_selection', 'num_samples')
+        lambda_u = self.config.get('target_selection', 'lambda_utility', 0.7)
+        beta = self.config.get('target_selection', 'beta_uncertainty', 0.3)
+        
+        print(f"🎯 하이브리드 타겟 샘플 선별 중... (목표: {num_samples}개)")
+        
+        model.eval()
+        
+        # 모든 타겟 샘플 수집 및 특징 추출
+        all_samples = []
+        all_features = []
+        all_utilities = []
+        all_uncertainties = []
+        
+        with torch.no_grad():
+            for data, target in target_train_loader:
+                for i in range(len(data)):
+                    x = data[i].unsqueeze(0).to(device)
+                    
+                    # 특징 추출 (마지막 FC 층 이전)
+                    if hasattr(model, 'fc'):
+                        # ResNet50의 경우 FC 층 전까지의 특징 추출
+                        modules = list(model.children())[:-1]  # FC 층 제외
+                        feature_extractor = nn.Sequential(*modules)
+                        features = feature_extractor(x)
+                        features = features.view(features.size(0), -1)
+                    else:
+                        features = x.view(x.size(0), -1)
+                    
+                    # 전체 예측
+                    output = model(x)
+                    probs = F.softmax(output, dim=1)
+                    
+                    # 의사 레이블 생성
+                    pseudo_label = torch.argmax(probs, dim=1)
+                    
+                    # 유용성 계산 (의사 레이블에 대한 손실의 음수)
+                    utility = -F.cross_entropy(output, pseudo_label).item()
+                    
+                    # 불확실성 계산 (엔트로피)
+                    uncertainty = -(probs * torch.log(probs + 1e-8)).sum().item()
+                    
+                    all_samples.append((data[i], target[i]))
+                    all_features.append(features.cpu())
+                    all_utilities.append(utility)
+                    all_uncertainties.append(uncertainty)
+        
+        print(f"📊 전체 타겟 샘플: {len(all_samples)}개")
+        
+        # 의사 라벨 추가 계산
+        all_pseudo_labels = []
+        with torch.no_grad():
+            for data, target in [(s[0], s[1]) for s in all_samples]:
+                x = data.unsqueeze(0).to(device)
+                output = model(x)
+                probs = F.softmax(output, dim=1)
+                pseudo_label = torch.argmax(probs, dim=1).item()
+                all_pseudo_labels.append(pseudo_label)
+        
+        # 점진적 선별 (그리디 방식)
+        selected_indices = []
+        selected_features = []
+        selected_pseudo_labels = []
+        
+        for step in range(min(num_samples, len(all_samples))):
+            best_score = float('-inf')
+            best_idx = -1
             
-        if abs(final_source_acc - initial_source_acc) < 2.0:  # 2% 이내 변화
-            print("✅ 소스 도메인 성능 유지 성공!")
+            for i, (utility, uncertainty, features, pseudo_label) in enumerate(zip(all_utilities, all_uncertainties, all_features, all_pseudo_labels)):
+                if i in selected_indices:
+                    continue
+                
+                # 1. 특징 공간 다양성
+                if len(selected_features) == 0:
+                    feature_diversity = 1.0  # 첫 번째 샘플
+                else:
+                    # 선택된 샘플들과의 최대 유사도
+                    max_similarity = 0.0
+                    for selected_feat in selected_features:
+                        # 코사인 유사도
+                        similarity = F.cosine_similarity(features, selected_feat, dim=1).item()
+                        max_similarity = max(max_similarity, similarity)
+                    feature_diversity = 1.0 - max_similarity
+                
+                # 2. 의사 라벨 다양성 (서로 다른 클래스 선호)
+                if len(selected_pseudo_labels) == 0:
+                    label_diversity = 1.0
+                else:
+                    same_label_count = sum(1 for label in selected_pseudo_labels if label == pseudo_label)
+                    label_diversity = 1.0 - (same_label_count / len(selected_pseudo_labels))
+                
+                # 3. 혼합 다양성 (특징 + 라벨)
+                diversity = 0.7 * feature_diversity + 0.3 * label_diversity
+                
+                # AlignSet 점수
+                alignset_score = lambda_u * utility + (1 - lambda_u) * diversity
+                
+                # 최종 하이브리드 점수
+                hybrid_score = alignset_score + beta * uncertainty
+                
+                if hybrid_score > best_score:
+                    best_score = hybrid_score
+                    best_idx = i
+            
+            if best_idx != -1:
+                selected_indices.append(best_idx)
+                selected_features.append(all_features[best_idx])
+                selected_pseudo_labels.append(all_pseudo_labels[best_idx])
+        
+        selected_samples = [all_samples[i] for i in selected_indices]
+        
+        # 클래스별 분포 출력 추가
+        class_counts = {}
+        for _, label in selected_samples:
+            label_item = label.item() if hasattr(label, 'item') else int(label)
+            class_counts[label_item] = class_counts.get(label_item, 0) + 1
+        
+        print(f"✅ 하이브리드 선별 완료: {len(selected_samples)}개")
+        print(f"📊 클래스별 선별된 샘플 분포:")
+        for class_id in sorted(class_counts.keys()):
+            print(f"   클래스 {class_id:2d}: {class_counts[class_id]:3d}개")
+        
+        return selected_samples
+    
+    def _select_random(self, target_train_loader: DataLoader) -> List[Tuple]:
+        """랜덤 선별"""
+        num_samples = self.config.get('target_selection', 'num_samples')
+        
+        all_samples = []
+        for data, target in target_train_loader:
+            for i in range(len(data)):
+                all_samples.append((data[i], target[i]))
+        
+        total_samples = len(all_samples)
+        select_count = min(num_samples, total_samples)
+        
+        random.seed(42)
+        selected_samples = random.sample(all_samples, select_count)
+        
+        print(f"✅ 랜덤 선별 완료: {len(selected_samples)}개 / {total_samples}개")
+        return selected_samples
+
+class InfluenceCalculator:
+    """영향도 계산 클래스 - 영향도 기반 필터링"""
+    
+    def __init__(self, config: SDAUConfig):
+        self.config = config
+    
+    def compute_influence_scores(self, model: nn.Module, source_loader: DataLoader, 
+                               target_samples: List[Tuple]) -> Tuple[List[Tuple], List[float]]:
+        """영향도 기반 유해 소스 샘플 필터링"""
+        method = self.config.get('influence_calculation', 'method')
+        num_samples = self.config.get('influence_calculation', 'num_samples')
+        
+        if method == 'influence_filtering':
+            return self._compute_influence_filtering(model, source_loader, target_samples, num_samples)
+        elif method == 'simple':
+            return self._compute_simple_influence(model, source_loader, target_samples, num_samples)
         else:
-            print("⚠️ 소스 도메인 성능 크게 변화됨")
+            raise ValueError(f"지원하지 않는 영향도 계산 방법: {method}")
+    
+    def _compute_influence_filtering(self, model: nn.Module, source_loader: DataLoader,
+                                   target_samples: List[Tuple], num_samples: int) -> Tuple[List[Tuple], List[float]]:
+        """영향도 기반 필터링 - 타겟 적응에 해로운 소스 샘플 식별"""
+        print(f"🔬 영향도 기반 필터링 중... (샘플: {num_samples}개)")
+        
+        model.eval()
+        damping = self.config.get('influence_calculation', 'damping', 0.01)
+        lissa_iterations = self.config.get('influence_calculation', 'lissa_iterations', 10)
+        
+        # 1. 타겟 배치의 평균 손실 기울기 계산
+        print("📊 타겟 배치 기울기 계산 중...")
+        target_gradients = []
+        
+        for data, target in target_samples:
+            data, target = data.unsqueeze(0).to(device), target.unsqueeze(0).to(device)
+            
+            model.zero_grad()
+            output = model(data)
+            loss = F.cross_entropy(output, target)
+            
+            grad = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
+            target_gradients.append([g.clone() for g in grad])
+        
+        # 타겟 평균 기울기
+        avg_target_grad = []
+        for i in range(len(target_gradients[0])):
+            param_grads = [tg[i] for tg in target_gradients]
+            avg_grad = torch.stack(param_grads).mean(dim=0)
+            avg_target_grad.append(avg_grad)
+        
+        # 2. LiSSA로 헤시안 역행렬 근사
+        h_estimate = [g.clone() for g in avg_target_grad]
+        
+        for iteration in range(lissa_iterations):
+            try:
+                batch_data, batch_target = next(iter(source_loader))
+                sample_idx = random.randint(0, len(batch_data) - 1)
+                data = batch_data[sample_idx:sample_idx+1].to(device)
+                target = batch_target[sample_idx:sample_idx+1].to(device)
+                
+                model.zero_grad()
+                output = model(data)
+                loss = F.cross_entropy(output, target)
+                
+                # 헤시안-벡터 곱
+                hvp = self._compute_hessian_vector_product(model, loss, h_estimate)
+                
+                # LiSSA 업데이트
+                for j in range(len(h_estimate)):
+                    h_estimate[j] = avg_target_grad[j] + h_estimate[j] - damping * hvp[j]
+                    
+            except Exception as e:
+                print(f"⚠️ LiSSA 반복 중 오류: {e}")
+                break
+        
+        # 3. 소스 샘플별 영향도 계산 I_up(z_i, D_T^batch)
+        influence_scores = []
+        source_samples = []
+        harmful_count = 0
+        
+        sample_count = 0
+        for batch_data, batch_target in source_loader:
+            if sample_count >= num_samples:
+                break
+                
+            for i in range(len(batch_data)):
+                if sample_count >= num_samples:
+                    break
+                    
+                data, target = batch_data[i].unsqueeze(0).to(device), batch_target[i].unsqueeze(0).to(device)
+                
+                try:
+                    model.zero_grad()
+                    output = model(data)
+                    loss = F.cross_entropy(output, target)
+                    
+                    source_grad = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
+                    
+                    # 영향도 계산: I_up = -∇L(D_T)^T * H^-1 * ∇L(z_i)
+                    influence = 0
+                    for sg, ihvp in zip(source_grad, h_estimate):
+                        influence += torch.sum(sg * ihvp).item()
+                    
+                    influence = -influence  # 논문 공식에 따른 음수
+                    
+                    # 음수 영향도 = 타겟 적응에 해로움
+                    if influence < 0:
+                        harmful_count += 1
+                    
+                    influence_scores.append(influence)
+                    source_samples.append((batch_data[i], batch_target[i]))
+                    sample_count += 1
+                        
+                except Exception as e:
+                    print(f"⚠️ 영향도 계산 실패 (샘플 {sample_count}): {e}")
+                    continue
+        
+        print(f"✅ 영향도 필터링 완료: {harmful_count}개 유해 샘플 / {len(influence_scores)}개 전체")
+        
+        return source_samples, influence_scores
+    
+    def _compute_simple_influence(self, model: nn.Module, source_loader: DataLoader,
+                                target_samples: List[Tuple], num_samples: int) -> Tuple[List[Tuple], List[float]]:
+        """간단한 영향도 계산"""
+        model.eval()
+        
+        # 타겟 샘플들의 손실 계산
+        target_losses = []
+        for data, target in target_samples:
+            data, target = data.unsqueeze(0).to(device), target.unsqueeze(0).to(device)
+            with torch.no_grad():
+                output = model(data)
+                loss = F.cross_entropy(output, target)
+                target_losses.append(loss.item())
+        
+        avg_target_loss = np.mean(target_losses)
+        
+        # 소스 샘플들의 영향도 계산
+        influence_scores = []
+        source_samples = []
+        
+        sample_count = 0
+        for batch_data, batch_target in source_loader:
+            if sample_count >= num_samples:
+                break
+                
+            for i in range(len(batch_data)):
+                if sample_count >= num_samples:
+                    break
+                    
+                data, target = batch_data[i].unsqueeze(0).to(device), batch_target[i].unsqueeze(0).to(device)
+                
+                with torch.no_grad():
+                    output = model(data)
+                    loss = F.cross_entropy(output, target)
+                    influence = loss.item() - avg_target_loss
+                    
+                influence_scores.append(influence)
+                source_samples.append((batch_data[i], batch_target[i]))
+                sample_count += 1
+        
+        return source_samples, influence_scores
+    
+    def _compute_hessian_vector_product(self, model: nn.Module, loss: torch.Tensor, 
+                                      vector: List[torch.Tensor]) -> List[torch.Tensor]:
+        """헤시안-벡터 곱 계산"""
+        grad = torch.autograd.grad(loss, model.parameters(), create_graph=True, retain_graph=True)
+        grad_vector_product = sum(torch.sum(g * v) for g, v in zip(grad, vector))
+        
+        hvp = torch.autograd.grad(grad_vector_product, model.parameters(), retain_graph=True)
+        return list(hvp)
+
+class UnlearningEngine:
+    """언러닝 엔진 클래스 - 동적 직교성 스케일링(DOS)"""
+    
+    def __init__(self, config: SDAUConfig):
+        self.config = config
+    
+    def perform_unlearning(self, model: nn.Module, harmful_samples: List[Tuple], 
+                          influence_scores: List[float], retain_samples: List[Tuple],
+                          target_test_loader: DataLoader) -> float:
+        """동적 직교성 스케일링(DOS) 언러닝 수행"""
+        method = self.config.get('unlearning', 'method')
+        
+        if method == 'dos':
+            return self._perform_dos_unlearning(model, harmful_samples, influence_scores, 
+                                              retain_samples, target_test_loader)
+        elif method == 'simple_dos':
+            return self._perform_simple_dos_unlearning(model, harmful_samples, influence_scores)
+        else:
+            raise ValueError(f"지원하지 않는 언러닝 방법: {method}")
+    
+    def _perform_dos_unlearning(self, model: nn.Module, harmful_samples: List[Tuple],
+                              influence_scores: List[float], retain_samples: List[Tuple],
+                              target_test_loader: DataLoader) -> float:
+        """동적 직교성 스케일링(DOS) 언러닝"""
+        num_steps = self.config.get('unlearning', 'num_steps', 10)
+        unlearn_lr = self.config.get('unlearning', 'learning_rate', 0.001)
+        
+        print(f"🔧 DOS 언러닝 수행 중... (삭제: {len(harmful_samples)}개, 유지: {len(retain_samples)}개)")
+        
+        model.train()
+        
+        # 언러닝 전 성능 기록
+        pre_unlearn_target_acc = self._evaluate_model(model, target_test_loader)
+        
+        # 1. 유해성 가중치 계산 및 정규화 (w_i = -I_up(z_i))
+        harmful_weights = []
+        for score in influence_scores:
+            weight = max(-score, 0)  # 음수 영향도만 사용
+            harmful_weights.append(weight)
+        
+        total_weight = sum(harmful_weights)
+        if total_weight > 0:
+            normalized_weights = [w / total_weight for w in harmful_weights]
+        else:
+            normalized_weights = [1.0 / len(harmful_samples)] * len(harmful_samples)
+        
+        # 2. 유지 세트의 평균 기울기 계산
+        retain_gradients = []
+        for data, target in retain_samples:
+            data, target = data.unsqueeze(0).to(device), target.unsqueeze(0).to(device)
+            
+            model.zero_grad()
+            output = model(data)
+            loss = F.cross_entropy(output, target)
+            
+            grad = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
+            retain_gradients.append([g.clone() for g in grad])
+        
+        # 평균 유지 기울기
+        avg_retain_grad = []
+        for i in range(len(retain_gradients[0])):
+            param_grads = [rg[i] for rg in retain_gradients]
+            avg_grad = torch.stack(param_grads).mean(dim=0)
+            avg_retain_grad.append(avg_grad)
+        
+        # DOS 언러닝 수행
+        unlearn_optimizer = optim.SGD(model.parameters(), lr=unlearn_lr)
+        
+        for step in range(num_steps):
+            # 3. 가중치 적용된 삭제 기울기 계산 (g_f^weighted)
+            weighted_forget_grad = None
+            
+            for (data, target), weight in zip(harmful_samples, normalized_weights):
+                data, target = data.unsqueeze(0).to(device), target.unsqueeze(0).to(device)
+                
+                model.zero_grad()
+                output = model(data)
+                loss = F.cross_entropy(output, target)
+                
+                grad = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
+                
+                if weighted_forget_grad is None:
+                    weighted_forget_grad = [weight * g for g in grad]
+                else:
+                    for i, g in enumerate(grad):
+                        weighted_forget_grad[i] += weight * g
+            
+            # 4. 직교 언러닝: 유지 지식 방향 성분 제거
+            if weighted_forget_grad is not None:
+                dot_product = 0
+                retain_norm_squared = 0
+                
+                for wfg, arg in zip(weighted_forget_grad, avg_retain_grad):
+                    dot_product += torch.sum(wfg * arg).item()
+                    retain_norm_squared += torch.sum(arg * arg).item()
+                
+                if retain_norm_squared > 1e-8:
+                    projection_coeff = dot_product / retain_norm_squared
+                else:
+                    projection_coeff = 0
+                
+                # 5. 직교 기울기로 파라미터 업데이트
+                unlearn_optimizer.zero_grad()
+                
+                for param, wfg, arg in zip(model.parameters(), weighted_forget_grad, avg_retain_grad):
+                    orthogonal_grad = wfg - projection_coeff * arg
+                    param.grad = orthogonal_grad.clone()
+                
+                unlearn_optimizer.step()
+        
+        # 언러닝 후 성능 확인
+        post_unlearn_target_acc = self._evaluate_model(model, target_test_loader)
+        performance_change = post_unlearn_target_acc - pre_unlearn_target_acc
+        
+        print(f"📊 언러닝 완료: {pre_unlearn_target_acc:.2f}% → {post_unlearn_target_acc:.2f}% ({performance_change:+.2f}%)")
+        
+        return performance_change
+    
+    def _perform_simple_dos_unlearning(self, model: nn.Module, harmful_samples: List[Tuple],
+                                     influence_scores: List[float]) -> float:
+        """간단한 DOS 언러닝"""
+        num_steps = self.config.get('unlearning', 'num_steps')
+        unlearn_lr = self.config.get('unlearning', 'learning_rate')
+        
+        flush_print(f"🔧 간단한 DOS 언러닝 수행 중... (스텝: {num_steps})")
+        
+        model.train()
+        unlearn_optimizer = optim.SGD(model.parameters(), lr=unlearn_lr)
+        
+        for step in range(num_steps):
+            total_loss = 0
+            
+            for data, target in harmful_samples:
+                data, target = data.unsqueeze(0).to(device), target.unsqueeze(0).to(device)
+                
+                unlearn_optimizer.zero_grad()
+                output = model(data)
+                
+                loss = F.cross_entropy(output, target)
+                unlearn_loss = -0.05 * loss  # 음수 강도
+                
+                unlearn_loss.backward()
+                unlearn_optimizer.step()
+                
+                total_loss += unlearn_loss.item()
+            
+            avg_loss = total_loss / len(harmful_samples)
+            flush_print(f"   스텝 {step+1}: 언러닝 손실 = {avg_loss:.4f}")
+        
+        flush_print("✅ 간단한 DOS 언러닝 완료")
+        return 0.0  # 성능 변화 반환하지 않음
+    
+    def _evaluate_model(self, model: nn.Module, data_loader: DataLoader, max_batches: int = None) -> float:
+        """모델 성능 평가 (전체 데이터 평가)"""
+        model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch_idx, (data, target) in enumerate(data_loader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                    
+                data, target = data.to(device), target.to(device)
+                outputs = model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+        
+        accuracy = 100 * correct / total
+        return accuracy
+
+class ModelTrainer:
+    """모델 훈련 클래스"""
+    
+    def __init__(self, config: SDAUConfig):
+        self.config = config
+    
+    def train_source_model(self, model: nn.Module, source_train_loader: DataLoader,
+                          source_test_loader: DataLoader, source_domain: str, dataset: str) -> float:
+        """소스 모델 훈련 또는 로딩"""
+        # 소스 모델 경로 설정
+        source_models_dir = Path(self.config.get('paths', 'source_models_dir')) / dataset
+        source_models_dir.mkdir(parents=True, exist_ok=True)
+        source_model_path = source_models_dir / f"{source_domain}_source_model.pt"
+        
+        flush_print(f"\n🔍 소스 모델 확인: {source_model_path}")
+        
+        # 기존 소스 모델 로딩 시도
+        if source_model_path.exists():
+            try:
+                flush_print(f"📥 기존 소스 모델 로딩 중...")
+                checkpoint = torch.load(source_model_path, map_location=device)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                
+                source_acc = self._evaluate_model(model, source_test_loader)
+                
+                if source_acc > 50.0:
+                    flush_print(f"✅ 기존 소스 모델 로딩 성공!")
+                    flush_print(f"   📊 소스 도메인 성능: {source_acc:.2f}%")
+                    return source_acc
+                else:
+                    flush_print(f"⚠️ 기존 모델 성능이 낮음 ({source_acc:.2f}%), 재훈련 필요")
+            except Exception as e:
+                flush_print(f"⚠️ 기존 모델 로딩 실패: {e}")
+        
+        # 새로운 소스 모델 훈련
+        flush_print(f"\n🏋️ 소스 도메인 훈련 시작...")
+        
+        model.train()
+        learning_rate = self.config.get('training', 'learning_rate')
+        weight_decay = self.config.get('training', 'weight_decay')
+        
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate * 2, weight_decay=weight_decay)
+        
+        best_source_acc = 0.0
+        best_source_state = None
+        patience = 0
+        max_patience = 30
+        
+        for epoch in range(100):  # 최대 100 에포크
+            total_loss = 0
+            correct = 0
+            total = 0
+            
+            for batch_idx, (data, target) in enumerate(source_train_loader):
+                # OfficeHome 호환성: target이 정수인 경우 텐서로 변환
+                if isinstance(target, (list, tuple)):
+                    target = torch.tensor(target)
+                elif not torch.is_tensor(target):
+                    target = torch.tensor([target] if isinstance(target, int) else target)
+                
+                data, target = data.to(device), target.to(device)
+                
+                optimizer.zero_grad()
+                output = model(data)
+                loss = F.cross_entropy(output, target)
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                _, predicted = torch.max(output.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+            
+            train_acc = 100 * correct / total
+            source_acc = self._evaluate_model(model, source_test_loader)
+            
+            flush_print(f"   에포크 {epoch+1:2d}: 훈련 {train_acc:5.2f}% | 테스트 {source_acc:5.2f}%")
+            
+            if source_acc > best_source_acc:
+                best_source_acc = source_acc
+                best_source_state = copy.deepcopy(model.state_dict())
+                patience = 0
+                
+                # 최고 성능 모델 저장
+                torch.save({
+                    'model_state_dict': best_source_state,
+                    'source_accuracy': best_source_acc,
+                    'epoch': epoch + 1,
+                    'config': self.config.config
+                }, source_model_path)
+                flush_print(f"      💾 최고 성능 저장 (성능: {source_acc:.2f}%)")
+            else:
+                patience += 1
+                
+            if patience >= max_patience:
+                flush_print(f"   ⏱️ 성능 개선 없음 ({max_patience}에포크). 조기 종료")
+                break
+        
+        # 최고 성능 모델로 복원
+        if best_source_state is not None:
+            model.load_state_dict(best_source_state)
+            flush_print(f"✅ 소스 모델 훈련 완료! 최고 성능: {best_source_acc:.2f}%")
+            return best_source_acc
+        else:
+            flush_print(f"❌ 소스 모델 훈련 실패")
+            return 0.0
+    
+    def train_with_target_samples(self, model: nn.Module, target_samples: List[Tuple], 
+                                 num_epochs: int = 1) -> None:
+        """타겟 샘플로 적응 훈련"""
+        if not target_samples:
+            return
+            
+        model.train()
+        
+        learning_rate = self.config.get('training', 'learning_rate')
+        weight_decay = self.config.get('training', 'weight_decay')
+        
+        # 샘플 수에 따른 학습률 조정 (안전한 학습률로 변경)
+        if len(target_samples) < 50:
+            initial_lr = learning_rate * 0.5
+            final_lr = learning_rate * 0.1
+        else:
+            initial_lr = learning_rate * 1.0
+            final_lr = learning_rate * 0.2
+        
+        optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=weight_decay * 0.2)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=final_lr)
+        
+        # 배치 처리
+        if len(target_samples) >= 24:
+            batch_size = 8
+            target_dataset = [(data, target) for data, target in target_samples]
+            target_loader = DataLoader(target_dataset, batch_size=batch_size, shuffle=True)
+            use_batches = True
+        elif len(target_samples) >= 12:
+            batch_size = 6
+            target_dataset = [(data, target) for data, target in target_samples]
+            target_loader = DataLoader(target_dataset, batch_size=batch_size, shuffle=True)
+            use_batches = True
+        else:
+            use_batches = False
+            repeat_factor = max(1, 8 // len(target_samples))
+        
+        for epoch in range(num_epochs):
+            total_loss = 0
+            batch_count = 0
+            
+            if use_batches:
+                for data_batch, target_batch in target_loader:
+                    data_batch, target_batch = data_batch.to(device), target_batch.to(device)
+                    
+                    optimizer.zero_grad()
+                    output = model(data_batch)
+                    loss = F.cross_entropy(output, target_batch)
+                    
+                    # L2 정규화
+                    if weight_decay > 0:
+                        l2_reg = torch.tensor(0., requires_grad=True).to(device)
+                        for param in model.parameters():
+                            l2_reg = l2_reg + torch.norm(param, 2)
+                        loss = loss + weight_decay * 0.1 * l2_reg
+                    
+                    loss.backward()
+                    
+                    # 그라디언트 클리핑
+                    clip_norm = self.config.get('training', 'gradient_clip_norm')
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                    
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                    batch_count += 1
+            else:
+                for repeat in range(repeat_factor):
+                    for data, target in target_samples:
+                        data, target = data.unsqueeze(0).to(device), target.unsqueeze(0).to(device)
+                        
+                        optimizer.zero_grad()
+                        output = model(data)
+                        loss = F.cross_entropy(output, target)
+                        
+                        if weight_decay > 0:
+                            l2_reg = torch.tensor(0., requires_grad=True).to(device)
+                            for param in model.parameters():
+                                l2_reg = l2_reg + torch.norm(param, 2)
+                            loss = loss + weight_decay * 0.1 * l2_reg
+                        
+                        loss.backward()
+                        
+                        clip_norm = self.config.get('training', 'gradient_clip_norm')
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                        
+                        optimizer.step()
+                        
+                        total_loss += loss.item()
+                        batch_count += 1
+            
+            scheduler.step()
+    
+    def _evaluate_model(self, model: nn.Module, data_loader: DataLoader, max_batches: int = 20) -> float:
+        """모델 성능 평가"""
+        model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch_idx, (data, target) in enumerate(data_loader):
+                if batch_idx >= max_batches:
+                    break
+                    
+                data, target = data.to(device), target.to(device)
+                outputs = model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+        
+        accuracy = 100 * correct / total
+        return accuracy
+
+class SDAUAlgorithm:
+    """핵심 SDA-U 알고리즘 클래스 (완전 객체지향)"""
+    
+    def __init__(self, config_path: str = "config.json"):
+        """SDA-U 알고리즘 초기화"""
+        self.config = SDAUConfig(config_path)
+        self.model_manager = ModelManager(self.config)
+        self.data_manager = DataManager(self.config)
+        self.target_selector = TargetSampleSelector(self.config)
+        self.influence_calculator = InfluenceCalculator(self.config)
+        self.unlearning_engine = UnlearningEngine(self.config)
+        self.model_trainer = ModelTrainer(self.config)
+        
+        # GPU 최적화
+        if GPU_OPTIMIZED and self.config.get('gpu', 'auto_optimize'):
+            setup_gpu_optimizations()
+            flush_print(f"🚀 GPU 최적화 활성화: {get_gpu_info()['name']}")
+        
+        flush_print(f"🔧 디바이스: {device}")
+        flush_print(f"⚙️ 설정 로딩 완료: {self.config.config_path}")
+        
+    def run_experiment(self, dataset: str, source_domain: str, target_domain: str) -> ExperimentResults:
+        """전체 실험 실행"""
+        flush_print("\n" + "="*80)
+        flush_print("🎯 완전 객체지향 SDA-U 알고리즘 시작!")
+        flush_print("="*80)
+        flush_print(f"📊 데이터셋: {dataset}")
+        flush_print(f"🏠 소스 도메인: {source_domain}")
+        flush_print(f"🎯 타겟 도메인: {target_domain}")
+        
+        # 1. 데이터 로딩
+        batch_size = self.config.get('training', 'batch_size')
+        source_train_loader, source_test_loader, target_train_loader, target_test_loader, num_classes = \
+            self.data_manager.load_dataset(dataset, source_domain, target_domain, batch_size)
+        
+        flush_print(f"✅ 데이터 로딩 완료 (클래스 수: {num_classes})")
+        
+        # 2. 모델 생성 및 소스 모델 훈련
+        model = self.model_manager.create_model(num_classes)
+        flush_print(f"🤖 모델: {self.config.get('model', 'architecture')} (파라미터: {sum(p.numel() for p in model.parameters()):,})")
+        
+        source_accuracy = self.model_trainer.train_source_model(
+            model, source_train_loader, source_test_loader, source_domain, dataset)
+        
+        # 3. 핵심 SDA-U 알고리즘 실행
+        results = self._core_sda_u_algorithm(
+            model, source_train_loader, target_train_loader,
+            target_test_loader, source_test_loader, num_classes,
+            dataset, source_domain, target_domain
+        )
+        
+        return results
+    
+    def _core_sda_u_algorithm(self, model: nn.Module, source_train_loader: DataLoader,
+                             target_train_loader: DataLoader, target_test_loader: DataLoader,
+                             source_test_loader: DataLoader, num_classes: int,
+                             dataset: str, source_domain: str, target_domain: str) -> ExperimentResults:
+        """핵심 SDA-U 알고리즘 실행"""
+        
+        # 성능 히스토리 저장용
+        performance_history = {
+            'epoch': [],
+            'target_acc': [],
+            'source_acc': [],
+            'phase': [],
+            'unlearning_count': [],
+            'is_best': []
+        }
+        
+        # 모델 저장 경로 설정
+        model_save_dir = Path(self.config.get('paths', 'model_save_dir')) / f"{source_domain}2{target_domain}"
+        model_save_dir.mkdir(parents=True, exist_ok=True)
+        
+        best_model_path = model_save_dir / "best_model.pt"
+        final_model_path = model_save_dir / "final_model.pt"
+        performance_log_path = model_save_dir / "performance_history.json"
+        
+        flush_print(f"💾 모델 저장 경로: {model_save_dir}")
+        
+        # 1. 타겟 샘플 선별
+        target_samples = self.target_selector.select_samples(model, target_train_loader, num_classes)
+        flush_print(f"✅ 선별된 타겟 샘플: {len(target_samples)}개")
+        
+        # 초기 성능 측정
+        initial_target_acc = self._evaluate_model(model, target_test_loader)
+        initial_source_acc = self._evaluate_model(model, source_test_loader)
+        
+        flush_print(f"\n📊 초기 성능:")
+        flush_print(f"   🎯 타겟: {initial_target_acc:.2f}%")
+        flush_print(f"   🏠 소스: {initial_source_acc:.2f}%")
+        
+        # 초기 성능 히스토리에 추가
+        performance_history['epoch'].append(0)
+        performance_history['target_acc'].append(initial_target_acc)
+        performance_history['source_acc'].append(initial_source_acc)
+        performance_history['phase'].append('initial')
+        performance_history['unlearning_count'].append(0)
+        performance_history['is_best'].append(True)
+        
+        # 최고 성능 모델 추적
+        best_model_state = copy.deepcopy(model.state_dict())
+        best_target_acc = initial_target_acc
+        best_epoch = 0
+        
+        # 최고 성능 모델 저장
+        self.model_manager.save_model(model, str(best_model_path), {
+            'epoch': 0,
+            'target_accuracy': best_target_acc,
+            'source_accuracy': initial_source_acc,
+            'dataset': dataset,
+            'source_domain': source_domain,
+            'target_domain': target_domain
+        })
+        
+        # 설정값 읽기
+        max_epochs = self.config.get('training', 'max_epochs')
+        patience_limit = self.config.get('training', 'patience')
+        epoch_chunk_size = self.config.get('training', 'epoch_chunk_size')
+        
+        # 성능 정체 추적
+        stagnation_count = 0
+        unlearning_count = 0
+        
+        print(f"\n🏋️ 타겟 도메인 적응 훈련 시작 ({max_epochs}에포크, {patience_limit}에포크 정체 시 언러닝)")
+        
+        epoch = 0
+        while epoch < max_epochs:
+            # epoch_chunk_size 에포크씩 훈련
+            for sub_epoch in range(epoch_chunk_size):
+                if epoch + sub_epoch >= max_epochs:
+                    break
+                    
+                current_epoch = epoch + sub_epoch + 1
+                
+                # 1에포크 훈련
+                self.model_trainer.train_with_target_samples(model, target_samples, num_epochs=1)
+                
+                # 성능 측정 (설정값에 따라)
+                log_interval = self.config.get('performance', 'log_interval')
+                if current_epoch % log_interval == 0 or sub_epoch == epoch_chunk_size - 1:
+                    current_target_acc = self._evaluate_model(model, target_test_loader)
+                    current_source_acc = self._evaluate_model(model, source_test_loader)
+                    
+                    improvement = current_target_acc - best_target_acc
+                    is_best = current_target_acc > best_target_acc
+                    
+                    print(f"에포크 {current_epoch:3d}: 타겟 {current_target_acc:5.2f}% | 소스 {current_source_acc:5.2f}% {'🏆' if is_best else ''}")
+                    
+                    # 성능 히스토리에 추가
+                    performance_history['epoch'].append(current_epoch)
+                    performance_history['target_acc'].append(current_target_acc)
+                    performance_history['source_acc'].append(current_source_acc)
+                    performance_history['phase'].append('training')
+                    performance_history['unlearning_count'].append(unlearning_count)
+                    performance_history['is_best'].append(is_best)
+                    
+                    # 최고 성능 업데이트
+                    if is_best:
+                        best_target_acc = current_target_acc
+                        best_epoch = current_epoch
+                        best_model_state = copy.deepcopy(model.state_dict())
+                        stagnation_count = 0
+                        
+                        # 최고 성능 모델 저장
+                        self.model_manager.save_model(model, str(best_model_path), {
+                            'epoch': current_epoch,
+                            'target_accuracy': best_target_acc,
+                            'source_accuracy': current_source_acc,
+                            'unlearning_count': unlearning_count
+                        })
+            
+            epoch += epoch_chunk_size
+            
+            # epoch_chunk_size 단위로 정체 확인
+            last_target_acc = performance_history['target_acc'][-1] if performance_history['target_acc'] else 0
+            if last_target_acc <= best_target_acc:
+                stagnation_count += epoch_chunk_size
+                
+                # patience_limit 이상 정체 시 언러닝
+                if stagnation_count >= patience_limit and epoch < max_epochs:
+                    print(f"\n🔧 언러닝 수행 #{unlearning_count+1} (정체: {stagnation_count}에포크)")
+                    
+                    # 최고 성능 모델로 복원
+                    model.load_state_dict(best_model_state)
+                    
+                    # 영향도 계산 및 언러닝 수행
+                    performance_change = self._perform_unlearning_cycle(
+                        model, source_train_loader, target_samples, target_test_loader)
+                    
+                    unlearning_count += 1
+                    
+                    # 언러닝 후 성능 측정
+                    after_unlearn_target_acc = self._evaluate_model(model, target_test_loader)
+                    after_unlearn_source_acc = self._evaluate_model(model, source_test_loader)
+                    
+                    # 성능 히스토리에 추가
+                    performance_history['epoch'].append(epoch)
+                    performance_history['target_acc'].append(after_unlearn_target_acc)
+                    performance_history['source_acc'].append(after_unlearn_source_acc)
+                    performance_history['phase'].append(f'unlearning_{unlearning_count}')
+                    performance_history['unlearning_count'].append(unlearning_count)
+                    performance_history['is_best'].append(after_unlearn_target_acc > best_target_acc)
+                    
+                    # 언러닝으로 성능이 개선되면 최고 성능 업데이트
+                    if after_unlearn_target_acc > best_target_acc:
+                        print(f"🏆 언러닝으로 최고 성능 갱신! {best_target_acc:.2f}% → {after_unlearn_target_acc:.2f}%")
+                        best_target_acc = after_unlearn_target_acc
+                        best_epoch = epoch
+                        best_model_state = copy.deepcopy(model.state_dict())
+                        
+                        self.model_manager.save_model(model, str(best_model_path), {
+                            'epoch': epoch,
+                            'target_accuracy': best_target_acc,
+                            'source_accuracy': after_unlearn_source_acc,
+                            'unlearning_count': unlearning_count,
+                            'phase': f'unlearning_{unlearning_count}'
+                        })
+                    
+                    stagnation_count = 0  # 정체 카운트 리셋
+            else:
+                stagnation_count = 0  # 성능이 개선되면 정체 카운트 리셋
+            
+            # 중간 성능 히스토리 저장
+            if epoch % 50 == 0:
+                with open(performance_log_path, 'w', encoding='utf-8') as f:
+                    json.dump(performance_history, f, indent=2, ensure_ascii=False)
+        
+        # 최종 최고 성능 모델로 복원
+        flush_print(f"\n🏆 최종 최고 성능 모델로 복원 (에포크 {best_epoch}, 성능: {best_target_acc:.2f}%)")
+        model.load_state_dict(best_model_state)
+        
+        # 최종 성능 측정
+        final_target_acc = self._evaluate_model(model, target_test_loader)
+        final_source_acc = self._evaluate_model(model, source_test_loader)
+        
+        # 최종 성능을 히스토리에 추가
+        performance_history['epoch'].append('final')
+        performance_history['target_acc'].append(final_target_acc)
+        performance_history['source_acc'].append(final_source_acc)
+        performance_history['phase'].append('final')
+        performance_history['unlearning_count'].append(unlearning_count)
+        performance_history['is_best'].append(final_target_acc >= best_target_acc)
+        
+        # 최종 모델 저장
+        self.model_manager.save_model(model, str(final_model_path), {
+            'epoch': 'final',
+            'target_accuracy': final_target_acc,
+            'source_accuracy': final_source_acc,
+            'best_target_accuracy': best_target_acc,
+            'best_epoch': best_epoch,
+            'unlearning_count': unlearning_count,
+            'performance_history': performance_history
+        })
+        
+        # 최종 성능 히스토리 저장
+        with open(performance_log_path, 'w', encoding='utf-8') as f:
+            json.dump(performance_history, f, indent=2, ensure_ascii=False)
+        
+        # 결과 출력
+        print(f"\n{'='*60}")
+        print("🎯 SDA-U 알고리즘 완료!")
+        print(f"{'='*60}")
+        print(f"📊 최종 결과:")
+        print(f"   타겟: {initial_target_acc:.2f}% → {final_target_acc:.2f}% ({final_target_acc-initial_target_acc:+.2f}%)")
+        print(f"   소스: {initial_source_acc:.2f}% → {final_source_acc:.2f}%")
+        print(f"   🏆 최고: {best_target_acc:.2f}% (에포크 {best_epoch})")
+        print(f"   언러닝: {unlearning_count}회, 에포크: {min(epoch, max_epochs)}")
+        
+        return ExperimentResults(
+            initial_target_acc=initial_target_acc,
+            final_target_acc=final_target_acc,
+            best_target_acc=best_target_acc,
+            best_epoch=best_epoch,
+            improvement=final_target_acc - initial_target_acc,
+            best_improvement=best_target_acc - initial_target_acc,
+            unlearning_count=unlearning_count,
+            total_epochs=min(epoch, max_epochs),
+            performance_history=performance_history,
+            model_paths={
+                'best_model': str(best_model_path),
+                'final_model': str(final_model_path),
+                'performance_log': str(performance_log_path)
+            }
+        )
+    
+    def _perform_unlearning_cycle(self, model: nn.Module, source_train_loader: DataLoader,
+                                 target_samples: List[Tuple], target_test_loader: DataLoader) -> float:
+        """언러닝 사이클 수행"""
+        # 영향도 계산
+        flush_print(f"🧮 영향도 계산 중...")
+        source_samples, influence_scores = self.influence_calculator.compute_influence_scores(
+            model, source_train_loader, target_samples)
+        
+        # 유해한 샘플 선별 (음수 영향도만)
+        harmful_indices = [i for i, score in enumerate(influence_scores) if score < 0]
+        harmful_samples = [source_samples[i] for i in harmful_indices]
+        harmful_influence_scores = [influence_scores[i] for i in harmful_indices]
+        
+        # 최대 샘플 수 제한
+        max_influence_samples = self.config.get('influence_calculation', 'max_influence_samples')
+        if len(harmful_samples) > max_influence_samples:
+            sorted_pairs = sorted(zip(harmful_samples, harmful_influence_scores), 
+                                key=lambda x: x[1])  # 음수가 작을수록 더 유해
+            harmful_samples = [pair[0] for pair in sorted_pairs[:max_influence_samples]]
+            harmful_influence_scores = [pair[1] for pair in sorted_pairs[:max_influence_samples]]
+        
+        flush_print(f"🔍 유해 샘플 발견: {len(harmful_samples)}개 (전체 {len(source_samples)}개 중)")
+        
+        if len(harmful_samples) > 0:
+            # 언러닝 수행
+            performance_change = self.unlearning_engine.perform_unlearning(
+                model, harmful_samples, harmful_influence_scores, target_samples, target_test_loader)
+            
+            flush_print(f"📊 언러닝 성능 변화: {performance_change:+.2f}%")
+            return performance_change
+        else:
+            flush_print("⚠️ 유해한 소스 샘플이 발견되지 않음. 언러닝 건너뛰기.")
+            return 0.0
+    
+    def _evaluate_model(self, model: nn.Module, data_loader: DataLoader) -> float:
+        """모델 성능 평가"""
+        model.eval()
+        correct = 0
+        total = 0
+        
+        max_batches = self.config.get('performance', 'evaluation_batch_limit')
+        
+        with torch.no_grad():
+            for batch_idx, (data, target) in enumerate(data_loader):
+                if batch_idx >= max_batches:
+                    break
+                    
+                data, target = data.to(device), target.to(device)
+                outputs = model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+        
+        accuracy = 100 * correct / total
+        return accuracy
+
+def main():
+    """메인 함수 (완전 객체지향)"""
+    parser = argparse.ArgumentParser(description='완전 객체지향 SDA-U 알고리즘')
+    
+    # 필수 인자
+    parser.add_argument('--dataset', type=str, required=True, choices=['Office31', 'OfficeHome'])
+    parser.add_argument('--source_domain', type=str, required=True)
+    parser.add_argument('--target_domain', type=str, required=True)
+    
+    # 선택적 인자
+    parser.add_argument('--config', type=str, default='config.json', help='설정 파일 경로')
+    parser.add_argument('--results_file', type=str, default='results.json', help='결과 파일 경로')
+    
+    args = parser.parse_args()
+    
+    flush_print("🎯 완전 객체지향 SDA-U 알고리즘 시작!")
+    flush_print(f"📊 실험 설정:")
+    flush_print(f"   데이터셋: {args.dataset}")
+    flush_print(f"   소스 도메인: {args.source_domain}")
+    flush_print(f"   타겟 도메인: {args.target_domain}")
+    flush_print(f"   설정 파일: {args.config}")
+    
+    try:
+        # SDA-U 알고리즘 초기화 및 실행
+        sda_u = SDAUAlgorithm(config_path=args.config)
+        results = sda_u.run_experiment(args.dataset, args.source_domain, args.target_domain)
+        
+        # 결과 저장
+        results_dict = {
+            'dataset': args.dataset,
+            'source_domain': args.source_domain,
+            'target_domain': args.target_domain,
+            'initial_target_acc': results.initial_target_acc,
+            'final_target_acc': results.final_target_acc,
+            'best_target_acc': results.best_target_acc,
+            'best_epoch': results.best_epoch,
+            'improvement': results.improvement,
+            'best_improvement': results.best_improvement,
+            'unlearning_count': results.unlearning_count,
+            'total_epochs': results.total_epochs,
+            'model_paths': results.model_paths,
+            'timestamp': time.time()
+        }
+        
+        # 결과 디렉토리 생성
+        results_dir = Path(sda_u.config.get('paths', 'results_dir'))
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 결과 파일 저장
+        results_path = results_dir / args.results_file
+        with open(results_path, 'w', encoding='utf-8') as f:
+            json.dump(results_dict, f, indent=2, ensure_ascii=False)
+        
+        flush_print(f"\n💾 결과 저장 완료:")
+        flush_print(f"   📄 결과 파일: {results_path}")
+        flush_print(f"   🏆 최고 모델: {results.model_paths['best_model']}")
+        flush_print(f"   📊 성능 로그: {results.model_paths['performance_log']}")
+        
+        flush_print(f"\n🎉 실험 완료! 최고 성능: {results.best_target_acc:.2f}%")
         
     except Exception as e:
-        print(f"\n❌ 실험 중 오류 발생: {str(e)}")
+        flush_print(f"❌ 실험 실행 중 오류 발생: {e}")
         import traceback
         traceback.print_exc()
         return 1
@@ -1141,4 +1329,4 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    main() 
+    exit(main()) 

@@ -353,6 +353,39 @@ class Office31Manager:
             print(f"   📊 {source_info['size']}개 → {target_info['size']}개")
             print()
     
+    def load_domain_data(self, domain, transform=None, image_size=224):
+        """단일 도메인의 훈련/테스트 데이터셋을 반환합니다."""
+        
+        print(f"📦 Office-31 {domain.upper()} 도메인 데이터 로딩...")
+        
+        if transform is None:
+            transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])  # ImageNet 정규화
+            ])
+        
+        # Office-31은 훈련/테스트 분할이 없으므로 전체 데이터를 80:20으로 분할
+        full_dataset = Office31Dataset(
+            root=self.root, domain=domain, transform=transform, download=True
+        )
+        
+        # 훈련/테스트 분할 (80:20)
+        total_size = len(full_dataset)
+        train_size = int(0.8 * total_size)
+        test_size = total_size - train_size
+        
+        train_dataset, test_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, test_size]
+        )
+        
+        print(f"✅ {domain.upper()} 도메인 로딩 완료!")
+        print(f"   📊 훈련 데이터: {len(train_dataset)}개")
+        print(f"   📊 테스트 데이터: {len(test_dataset)}개")
+        
+        return train_dataset, test_dataset
+
     def create_data_loaders(self, source_domain, target_domain, batch_size=32, 
                           image_size=224, num_workers=2):
         """Office-31 데이터 로더들을 생성합니다."""

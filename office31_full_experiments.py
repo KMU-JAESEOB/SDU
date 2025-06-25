@@ -1,576 +1,592 @@
 #!/usr/bin/env python3
-# office31_full_experiments.py - Office-31 전체 도메인 조합 실험
+# office31_full_experiments.py - Office31 종합 실험 도구
 
 """
-🏢 Office-31 전체 도메인 조합 SDA-U 실험
+🎯 Office31 종합 실험 도구
 
-Office-31의 6가지 도메인 조합에 대해 SDA-U 실험을 수행하고
-소스와 타겟 도메인 성능을 종합적으로 분석합니다.
+기능:
+1. 모든 소스-타겟 도메인 조합 실험 
+2. 타겟 샘플 수별 성능 비교 (100~600개)
+3. λ_u, β 하이퍼파라미터 그리드 서치
+4. 언러닝 효과 시각화
 
-실험 조합:
-1. Amazon → Webcam (고품질 → 저품질)
-2. Amazon → DSLR (인공적 → 자연스러운)  
-3. Webcam → Amazon (저품질 → 고품질)
-4. Webcam → DSLR (저품질 → 고품질)
-5. DSLR → Amazon (자연스러운 → 인공적)
-6. DSLR → Webcam (고품질 → 저품질)
+사용법:
+python office31_full_experiments.py --experiment [domain_pairs|sample_sizes|hyperparams|all]
 """
 
 import os
+import sys
 import json
+import copy
 import time
-import subprocess
-from datetime import datetime
+import argparse
 from pathlib import Path
+from typing import Dict, List, Tuple, Any
+import subprocess
 
-class Office31FullExperiments:
-    """Office-31 전체 도메인 조합 실험 관리자"""
+# 시각화를 위한 라이브러리
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    import seaborn as sns
+    import matplotlib.font_manager as fm
     
-    def __init__(self):
-        self.results_dir = Path('office31_results')
-        self.results_dir.mkdir(exist_ok=True)
+    # 한글 폰트 설정 (에러 방지)
+    try:
+        # 사용 가능한 한글 폰트 찾기
+        font_list = [f.name for f in fm.fontManager.ttflist]
+        korean_fonts = ['Malgun Gothic', 'AppleGothic', 'NanumGothic', 'Arial Unicode MS']
+        available_korean_font = None
         
-        # Office-31 도메인 조합 정의
-        self.domain_combinations = [
-            ('Office31_Amazon', 'Office31_Webcam', 'Amazon→Webcam: 고품질→저품질'),
-            ('Office31_Amazon', 'Office31_DSLR', 'Amazon→DSLR: 인공적→자연스러운'),
-            ('Office31_Webcam', 'Office31_Amazon', 'Webcam→Amazon: 저품질→고품질'),
-            ('Office31_Webcam', 'Office31_DSLR', 'Webcam→DSLR: 저품질→고품질'),
-            ('Office31_DSLR', 'Office31_Amazon', 'DSLR→Amazon: 자연스러운→인공적'),
-            ('Office31_DSLR', 'Office31_Webcam', 'DSLR→Webcam: 고품질→저품질')
-        ]
+        for font in korean_fonts:
+            if font in font_list:
+                available_korean_font = font
+                break
         
-        # 실험 결과 저장용
-        self.all_results = []
-        
-    def create_experiment_config(self, source_dataset, target_dataset, experiment_name):
-        """특정 도메인 조합을 위한 config.py 생성 (Office-31 호환성 강화)"""
-        
-        # 🎯 도메인별 적응 에포크 딕셔너리를 문자열로 안전하게 변환
-        domain_epochs_dict = {
-            'Amazon2Webcam': 10,     # 중간 난이도
-            'Amazon2DSLR': 8,        # 상대적으로 쉬움
-            'Webcam2Amazon': 12,     # 어려움 (작은→큰 데이터셋)
-            'Webcam2DSLR': 8,        # 중간
-            'DSLR2Amazon': 12,       # 어려움 (작은→큰 데이터셋)  
-            'DSLR2Webcam': 10        # 중간 난이도
-        }
-        
-        # 딕셔너리를 안전한 문자열로 변환
-        domain_epochs_str = "{\n"
-        for key, value in domain_epochs_dict.items():
-            domain_epochs_str += f"    '{key}': {value},     # 도메인별 설정\n"
-        domain_epochs_str += "}"
-        
-        config_content = f'''# config.py - Office-31 실험용 설정 ({experiment_name}) - 성능 최적화
-
-# ============================================
-# 🏢 Office-31 실험: {experiment_name} (고성능 설정)
-# ============================================
-ARCHITECTURE = 'resnet50'  # Office-31에 최적화된 아키텍처 (고정)
-BATCH_SIZE = 64           # A100에 최적화된 배치 크기 (32→64)
-NUM_EPOCHS = 15           # 충분한 학습을 위한 에포크 (5→15)
-LEARNING_RATE = 2e-4      # 사전 훈련 모델에 적합한 학습률 (1e-4→2e-4)
-
-# 데이터셋 설정
-SOURCE_DATASET = '{source_dataset}'
-TARGET_DATASET = '{target_dataset}'
-
-# SDA-U 알고리즘 설정 (성능 최적화)
-TARGET_SUBSET_SIZE = 600     # 더 많은 타겟 샘플 사용 (500→600)
-NUM_UNLEARN_STEPS = 8        # 더 정교한 언러닝 (5→8)
-INFLUENCE_SAMPLES = 300      # 더 많은 영향도 샘플 (200→300)
-ADAPTATION_EPOCHS = 10       # 적응 훈련 에포크 (8→10, 도메인별 조정 가능)
-MAX_UNLEARN_SAMPLES = 150    # 더 많은 언러닝 샘플 (100→150)
-
-# 🔄 다중 라운드 SDA-U 설정
-SDA_U_ROUNDS = 1            # SDA-U 라운드 수
-PROGRESSIVE_UNLEARNING = True  # 점진적 언러닝 여부
-DYNAMIC_THRESHOLD = True    # 동적 임계값 조정 여부
-
-# 🎯 사전 훈련 가중치 설정 (새로 추가!)
-USE_PRETRAINED = True       # ImageNet 사전 훈련 가중치 사용
-FREEZE_BACKBONE = False     # 백본 고정 여부 (False=fine-tuning)
-
-# 🔧 고급 훈련 설정 (새로 추가!)
-SCHEDULER_TYPE = 'cosine'   # 학습률 스케줄러 ('cosine', 'step', 'none')
-WARMUP_EPOCHS = 2          # 워밍업 에포크
-WEIGHT_DECAY = 1e-4        # 가중치 감쇠
-GRADIENT_CLIP = 1.0        # 그래디언트 클리핑
-
-# 하이브리드 스코어링 파라미터
-LAMBDA_U = 0.6
-BETA = 0.1
-
-# 저장 설정
-SAVE_MODELS = True
-SAVE_RESULTS = True
-QUICK_TEST = False  # 전체 데이터셋으로 실제 성능 측정
-
-# 🎯 도메인별 적응 에포크 설정 (새로 추가!)
-DOMAIN_SPECIFIC_EPOCHS = {domain_epochs_str}
-
-def get_config():
-    """설정을 반환하는 함수 (Office-31 고성능 최적화)"""
-    import torch
-    
-    # GPU 최적화 (A100에서도 ResNet50 강제 사용)
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        if "A100" in gpu_name:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
-            print("🚀 A100 최적화 활성화! (고성능 설정)")
-    
-    # 🚨 중요: 고성능 설정으로 업그레이드
-    return {{
-        'architecture': 'resnet50',
-        'batch_size': BATCH_SIZE,
-        'num_epochs': NUM_EPOCHS,
-        'learning_rate': LEARNING_RATE,
-        'target_subset_size': TARGET_SUBSET_SIZE,
-        'num_unlearn_steps': NUM_UNLEARN_STEPS,
-        'influence_samples': INFLUENCE_SAMPLES,
-        'adaptation_epochs': ADAPTATION_EPOCHS,
-        'max_unlearn_samples': MAX_UNLEARN_SAMPLES,
-        'sda_u_rounds': SDA_U_ROUNDS,
-        'progressive_unlearning': PROGRESSIVE_UNLEARNING,
-        'dynamic_threshold': DYNAMIC_THRESHOLD,
-        'use_pretrained': USE_PRETRAINED,
-        'freeze_backbone': FREEZE_BACKBONE,
-        'scheduler_type': SCHEDULER_TYPE,
-        'warmup_epochs': WARMUP_EPOCHS,
-        'weight_decay': WEIGHT_DECAY,
-        'gradient_clip': GRADIENT_CLIP,
-        'lambda_u': LAMBDA_U,
-        'beta': BETA,
-        'save_models': SAVE_MODELS,
-        'save_results': SAVE_RESULTS,
-        'quick_test': QUICK_TEST,
-        'source_dataset': SOURCE_DATASET,
-        'target_dataset': TARGET_DATASET,
-        'domain_specific_epochs': DOMAIN_SPECIFIC_EPOCHS,
-        'gpu_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
-    }}
-'''
-        
-        with open('config.py', 'w', encoding='utf-8') as f:
-            f.write(config_content)
+        if available_korean_font:
+            plt.rcParams['font.family'] = [available_korean_font, 'DejaVu Sans']
+        else:
+            # 한글 폰트가 없으면 영어만 사용
+            plt.rcParams['font.family'] = ['DejaVu Sans']
             
-    def run_single_experiment(self, source_dataset, target_dataset, description):
-        """단일 도메인 조합 실험 실행 (체계적 파일 관리)"""
+        plt.rcParams['axes.unicode_minus'] = False
+    except:
+        # 폰트 설정 실패 시 기본값 유지
+        pass
+    
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    print("⚠️ 시각화 라이브러리 없음. pip install matplotlib seaborn pandas 실행하세요.")
+
+# main.py의 SDAUAlgorithm 클래스 import
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from main import SDAUAlgorithm, SDAUConfig
+    MAIN_AVAILABLE = True
+except ImportError:
+    MAIN_AVAILABLE = False
+    print("⚠️ main.py import 실패. 환경 설정 문제일 수 있습니다.")
+
+class Office31ExperimentRunner:
+    """Office31 종합 실험 실행기"""
+    
+    def __init__(self, base_config_path: str = "config.json"):
+        self.base_config_path = base_config_path
+        self.results_dir = Path("results/office31_comprehensive")
+        self.results_dir.mkdir(parents=True, exist_ok=True)
         
-        experiment_name = f"{source_dataset.split('_')[1]}2{target_dataset.split('_')[1]}"
+        # Office31 도메인 정의
+        self.domains = ["Amazon", "Webcam", "DSLR"]
+        self.domain_pairs = [(s, t) for s in self.domains for t in self.domains if s != t]
         
-        print(f"\n{'='*80}")
-        print(f"🧪 실험 시작: {experiment_name}")
-        print(f"📊 {description}")
-        print(f"📤 소스: {source_dataset}")
-        print(f"📥 타겟: {target_dataset}")
-        print(f"{'='*80}")
+        # 실험 설정
+        self.sample_sizes = [100, 200, 300, 400, 500, 600]
+        self.lambda_values = [0.5, 0.6, 0.7, 0.8, 0.9]
+        self.beta_values = [0.1, 0.2, 0.3, 0.4, 0.5]
         
-        # 🗂️ 실험별 디렉토리 생성
-        experiment_dir = self.results_dir / experiment_name
-        experiment_dir.mkdir(exist_ok=True)
+        print(f"🎯 Office31 종합 실험 초기화 완료")
+        print(f"📂 결과 저장: {self.results_dir}")
+    
+    def create_experiment_config(self, modifications: Dict[str, Any]) -> str:
+        """실험용 설정 파일 생성"""
+        # 기본 설정 로딩
+        with open(self.base_config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
         
-        models_dir = Path('models') / experiment_name
-        models_dir.mkdir(parents=True, exist_ok=True)
+        # 수정사항 적용
+        for key_path, value in modifications.items():
+            keys = key_path.split('.')
+            current = config
+            for key in keys[:-1]:
+                current = current[key]
+            current[keys[-1]] = value
         
-        print(f"📁 실험 디렉토리: {experiment_dir}")
-        print(f"📁 모델 디렉토리: {models_dir}")
+        # 임시 설정 파일 생성
+        temp_config_path = self.results_dir / f"temp_config_{int(time.time())}.json"
+        with open(temp_config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
         
-        # config.py 백업
-        if os.path.exists('config.py.backup'):
-            os.remove('config.py.backup')
-        if os.path.exists('config.py'):
-            os.rename('config.py', 'config.py.backup')
+        return str(temp_config_path)
+    
+    def run_single_experiment(self, source_domain: str, target_domain: str, 
+                            config_path: str, experiment_name: str) -> Dict[str, Any]:
+        """단일 실험 실행"""
+        print(f"🔬 실험 시작: {experiment_name} ({source_domain} → {target_domain})")
         
         try:
-            # 실험용 config.py 생성
-            self.create_experiment_config(source_dataset, target_dataset, experiment_name)
-            
-            # 실험 실행
-            start_time = time.time()
-            print("🚀 SDA-U 실험 실행 중...")
-            
-            process = subprocess.Popen(['python', 'main.py'], 
-                                     stdout=subprocess.PIPE, 
-                                     stderr=subprocess.STDOUT,
-                                     text=True, 
-                                     bufsize=1)
-            
-            # 실시간 출력 및 로그 저장
-            output_lines = []
-            log_file = experiment_dir / f"{experiment_name}_execution_log.txt"
-            
-            with open(log_file, 'w', encoding='utf-8') as log:
-                while True:
-                    if process.stdout is None:
-                        break
-                    output = process.stdout.readline()
-                    if output == '' and process.poll() is not None:
-                        break
-                    if output:
-                        print(output.strip())
-                        log.write(output)
-                        log.flush()
-                        output_lines.append(output.strip())
-            
-            return_code = process.poll()
-            end_time = time.time()
-            execution_time = end_time - start_time
-            
-            if return_code == 0:
-                print(f"✅ 실험 완료! (실행시간: {execution_time:.1f}초)")
+            if MAIN_AVAILABLE:
+                # 직접 실행 방식
+                sda_u = SDAUAlgorithm(config_path=config_path)
+                results = sda_u.run_experiment("Office31", source_domain, target_domain)
                 
-                # 🗂️ 결과 파일 체계적 관리
-                result_file = 'results/sda_u_comprehensive_results.json'
-                if os.path.exists(result_file):
-                    # 결과 로드 및 추가 정보 삽입
-                    with open(result_file, 'r', encoding='utf-8') as f:
-                        result_data = json.load(f)
-                    
-                    # 실험 메타데이터 추가
-                    result_data['experiment_info']['experiment_name'] = experiment_name
-                    result_data['experiment_info']['source_dataset'] = source_dataset
-                    result_data['experiment_info']['target_dataset'] = target_dataset
-                    result_data['experiment_info']['description'] = description
-                    result_data['experiment_info']['execution_time_seconds'] = execution_time
-                    result_data['experiment_info']['log_file'] = str(log_file)
-                    result_data['experiment_info']['models_directory'] = str(models_dir)
-                    
-                    # 🗂️ 다양한 형태로 결과 저장
-                    # 1. 메인 결과 파일
-                    main_result_file = experiment_dir / f"{experiment_name}_results.json"
-                    with open(main_result_file, 'w', encoding='utf-8') as f:
-                        json.dump(result_data, f, indent=2, ensure_ascii=False)
-                    
-                    # 2. 성능 요약 파일
-                    performance_summary = self.extract_performance_summary(result_data)
-                    summary_file = experiment_dir / f"{experiment_name}_performance_summary.json"
-                    with open(summary_file, 'w', encoding='utf-8') as f:
-                        json.dump(performance_summary, f, indent=2, ensure_ascii=False)
-                    
-                    # 3. 빠른 참조용 텍스트 파일
-                    quick_ref_file = experiment_dir / f"{experiment_name}_quick_reference.txt"
-                    with open(quick_ref_file, 'w', encoding='utf-8') as f:
-                        f.write(f"실험: {experiment_name}\n")
-                        f.write(f"소스 → 타겟: {source_dataset} → {target_dataset}\n")
-                        f.write(f"설명: {description}\n")
-                        f.write(f"실행시간: {execution_time:.1f}초\n")
-                        f.write(f"최종 타겟 정확도: {performance_summary.get('target_subset_accuracy', 0):.2f}%\n")
-                        f.write(f"전체 타겟 정확도: {performance_summary.get('full_target_accuracy', 0):.2f}%\n")
-                        f.write(f"최고 성능: {performance_summary.get('best_target_accuracy', 0):.2f}%\n")
-                    
-                    print(f"📋 메인 결과: {main_result_file}")
-                    print(f"📊 성능 요약: {summary_file}")
-                    print(f"⚡ 빠른 참조: {quick_ref_file}")
-                    print(f"📝 실행 로그: {log_file}")
-                    
-                    # 전체 결과에 추가
-                    self.all_results.append({
-                        'experiment_name': experiment_name,
-                        'source_dataset': source_dataset,
-                        'target_dataset': target_dataset,
-                        'description': description,
-                        'execution_time': execution_time,
-                        'result_data': result_data,
-                        'files': {
-                            'main_result': str(main_result_file),
-                            'performance_summary': str(summary_file),
-                            'quick_reference': str(quick_ref_file),
-                            'execution_log': str(log_file),
-                            'models_directory': str(models_dir)
-                        }
-                    })
-                    
-                    return True, result_data
-                else:
-                    print("⚠️ 결과 파일을 찾을 수 없습니다.")
-                    return False, None
+                return {
+                    'source_domain': source_domain,
+                    'target_domain': target_domain,
+                    'experiment_name': experiment_name,
+                    'initial_target_acc': results.initial_target_acc,
+                    'final_target_acc': results.final_target_acc,
+                    'best_target_acc': results.best_target_acc,
+                    'best_epoch': results.best_epoch,
+                    'improvement': results.improvement,
+                    'best_improvement': results.best_improvement,
+                    'unlearning_count': results.unlearning_count,
+                    'total_epochs': results.total_epochs,
+                    'success': True,
+                    'timestamp': time.time()
+                }
             else:
-                print(f"❌ 실험 실패! (반환코드: {return_code})")
-                return False, None
+                # subprocess 실행 방식
+                cmd = [
+                    sys.executable, 'main.py',
+                    '--dataset', 'Office31',
+                    '--source_domain', source_domain,
+                    '--target_domain', target_domain,
+                    '--config', config_path,
+                    '--results_file', f'{experiment_name}_results.json'
+                ]
                 
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                
+                if result.returncode == 0:
+                    print(f"✅ 성공: {experiment_name}")
+                    return {
+                        'source_domain': source_domain,
+                        'target_domain': target_domain,
+                        'experiment_name': experiment_name,
+                        'success': True,
+                        'timestamp': time.time()
+                    }
+                else:
+                    print(f"❌ 실패: {experiment_name}")
+                    return {
+                        'source_domain': source_domain,
+                        'target_domain': target_domain,
+                        'experiment_name': experiment_name,
+                        'success': False,
+                        'error': result.stderr,
+                        'timestamp': time.time()
+                    }
+                    
         except Exception as e:
-            print(f"❌ 실험 중 오류 발생: {e}")
-            return False, None
-            
-        finally:
-            # config.py 복원
-            if os.path.exists('config.py.backup'):
-                if os.path.exists('config.py'):
-                    os.remove('config.py')
-                os.rename('config.py.backup', 'config.py')
-    
-    def extract_performance_summary(self, result_data):
-        """결과에서 핵심 성능 지표 추출"""
-        
-        try:
-            final_perf = result_data.get('final_performance', {})
-            exp_info = result_data.get('experiment_info', {})
-            
+            print(f"❌ 오류: {experiment_name} - {e}")
             return {
-                'source_accuracy': final_perf.get('source_accuracy', 0),
-                'target_subset_accuracy': final_perf.get('target_subset_accuracy', 0),
-                'full_target_accuracy': final_perf.get('full_target_accuracy', 0),
-                'improvement': final_perf.get('improvement_over_baseline', 0),
-                'execution_time': exp_info.get('execution_time_seconds', 0),
-                'best_target_accuracy': exp_info.get('best_target_accuracy', 0)
-            }
-        except Exception as e:
-            print(f"⚠️ 성능 지표 추출 실패: {e}")
-            return {
-                'source_accuracy': 0,
-                'target_subset_accuracy': 0,
-                'full_target_accuracy': 0,
-                'improvement': 0,
-                'execution_time': 0,
-                'best_target_accuracy': 0
+                'source_domain': source_domain,
+                'target_domain': target_domain,
+                'experiment_name': experiment_name,
+                'success': False,
+                'error': str(e),
+                'timestamp': time.time()
             }
     
-    def create_performance_table(self):
-        """성능 결과를 테이블 형태로 정리 (pandas 없이)"""
+    def run_domain_pairs_experiment(self) -> Dict[str, Any]:
+        """모든 도메인 쌍 실험"""
+        print(f"\n🎯 도메인 쌍 실험 시작 (총 {len(self.domain_pairs)}개)")
         
-        if not self.all_results:
-            print("⚠️ 실험 결과가 없습니다.")
-            return None
+        results = []
+        for i, (source, target) in enumerate(self.domain_pairs, 1):
+            print(f"\n진행률: {i}/{len(self.domain_pairs)}")
+            
+            # 기본 설정으로 실험
+            config_path = self.create_experiment_config({})
+            experiment_name = f"domain_pairs_{source}2{target}"
+            
+            result = self.run_single_experiment(source, target, config_path, experiment_name)
+            results.append(result)
+            
+            # 임시 설정 파일 삭제
+            os.remove(config_path)
         
-        # 성능 데이터 추출
-        performance_data = []
-        for result in self.all_results:
-            perf = self.extract_performance_summary(result['result_data'])
-            performance_data.append({
-                '실험명': result['experiment_name'],
-                '소스→타겟': f"{result['source_dataset'].split('_')[1]}→{result['target_dataset'].split('_')[1]}",
-                '설명': result['description'],
-                '소스 정확도(%)': f"{perf['source_accuracy']:.2f}",
-                '타겟 서브셋 정확도(%)': f"{perf['target_subset_accuracy']:.2f}",
-                '전체 타겟 정확도(%)': f"{perf['full_target_accuracy']:.2f}",
-                '최고 타겟 정확도(%)': f"{perf['best_target_accuracy']:.2f}",
-                '개선도(%)': f"{perf['improvement']:.2f}",
-                '실행시간(초)': f"{perf['execution_time']:.1f}"
+        # 결과 저장
+        output_file = self.results_dir / "domain_pairs_results.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ 도메인 쌍 실험 완료! 결과: {output_file}")
+        return {'results': results, 'output_file': str(output_file)}
+    
+    def run_sample_sizes_experiment(self) -> Dict[str, Any]:
+        """타겟 샘플 수별 실험"""
+        print(f"\n📊 타겟 샘플 수별 실험 시작")
+        print(f"샘플 크기: {self.sample_sizes}")
+        
+        results = []
+        # 대표적인 도메인 쌍 선택 (Amazon → Webcam)
+        source, target = "Amazon", "Webcam"
+        
+        for i, num_samples in enumerate(self.sample_sizes, 1):
+            print(f"\n진행률: {i}/{len(self.sample_sizes)} - 샘플 {num_samples}개")
+            
+            # 타겟 샘플 수 설정
+            config_path = self.create_experiment_config({
+                'target_selection.num_samples': num_samples
             })
+            
+            experiment_name = f"sample_size_{num_samples}"
+            result = self.run_single_experiment(source, target, config_path, experiment_name)
+            result['num_samples'] = num_samples
+            results.append(result)
+            
+            # 임시 설정 파일 삭제
+            os.remove(config_path)
         
-        # CSV 파일로 저장 (pandas 없이)
-        csv_file = self.results_dir / 'office31_performance_summary.csv'
-        with open(csv_file, 'w', encoding='utf-8', newline='') as f:
-            if performance_data:
-                # 헤더 작성
-                headers = list(performance_data[0].keys())
-                f.write(','.join(headers) + '\n')
-                
-                # 데이터 작성
-                for row in performance_data:
-                    f.write(','.join(str(row[header]) for header in headers) + '\n')
+        # 결과 저장
+        output_file = self.results_dir / "sample_sizes_results.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
         
-        print(f"📊 성능 요약 테이블 저장: {csv_file}")
-        
-        return performance_data
+        print(f"✅ 샘플 수별 실험 완료! 결과: {output_file}")
+        return {'results': results, 'output_file': str(output_file)}
     
-    def print_performance_summary(self):
-        """성능 요약을 콘솔에 출력"""
+    def run_hyperparameter_experiment(self) -> Dict[str, Any]:
+        """하이퍼파라미터 그리드 서치"""
+        print(f"\n🔍 하이퍼파라미터 그리드 서치 시작")
+        print(f"λ_u 값: {self.lambda_values}")
+        print(f"β 값: {self.beta_values}")
+        print(f"총 조합: {len(self.lambda_values) * len(self.beta_values)}개")
         
-        if not self.all_results:
-            print("⚠️ 실험 결과가 없습니다.")
+        results = []
+        # 대표적인 도메인 쌍 선택 (Amazon → Webcam)
+        source, target = "Amazon", "Webcam"
+        
+        total_combinations = len(self.lambda_values) * len(self.beta_values)
+        current_combo = 0
+        
+        for lambda_u in self.lambda_values:
+            for beta in self.beta_values:
+                current_combo += 1
+                print(f"\n진행률: {current_combo}/{total_combinations} - λ_u={lambda_u}, β={beta}")
+                
+                # 하이퍼파라미터 설정
+                config_path = self.create_experiment_config({
+                    'target_selection.lambda_utility': lambda_u,
+                    'target_selection.beta_uncertainty': beta
+                })
+                
+                experiment_name = f"hyperparam_lambda{lambda_u}_beta{beta}"
+                result = self.run_single_experiment(source, target, config_path, experiment_name)
+                result['lambda_utility'] = lambda_u
+                result['beta_uncertainty'] = beta
+                results.append(result)
+                
+                # 임시 설정 파일 삭제
+                os.remove(config_path)
+        
+        # 결과 저장
+        output_file = self.results_dir / "hyperparameter_results.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ 하이퍼파라미터 실험 완료! 결과: {output_file}")
+        return {'results': results, 'output_file': str(output_file)}
+    
+    def create_visualizations(self) -> None:
+        """실험 결과 시각화"""
+        if not VISUALIZATION_AVAILABLE:
+            print("⚠️ 시각화 라이브러리가 없어 건너뛰기")
             return
         
-        print(f"\n{'='*100}")
-        print("📊 Office-31 전체 도메인 조합 실험 결과 요약")
-        print(f"{'='*100}")
+        print(f"\n📈 시각화 생성 중...")
         
-        # 테이블 헤더
-        print(f"{'실험명':<15} {'도메인 조합':<20} {'소스 정확도':<12} {'타겟 정확도':<12} {'최고 정확도':<12} {'실행시간':<10}")
-        print("-" * 100)
+        # 시각화 디렉토리 생성
+        viz_dir = self.results_dir / "visualizations"
+        viz_dir.mkdir(exist_ok=True)
         
-        # 각 실험 결과 출력
-        total_time = 0
-        best_experiment = None
-        best_accuracy = 0
+        # 1. 도메인 쌍 결과 시각화
+        self._plot_domain_pairs_results(viz_dir)
         
-        for result in self.all_results:
-            perf = self.extract_performance_summary(result['result_data'])
-            
-            print(f"{result['experiment_name']:<15} "
-                  f"{result['source_dataset'].split('_')[1]}→{result['target_dataset'].split('_')[1]:<19} "
-                  f"{perf['source_accuracy']:<11.2f}% "
-                  f"{perf['full_target_accuracy']:<11.2f}% "
-                  f"{perf['best_target_accuracy']:<11.2f}% "
-                  f"{perf['execution_time']:<9.1f}s")
-            
-            total_time += perf['execution_time']
-            
-            if perf['best_target_accuracy'] > best_accuracy:
-                best_accuracy = perf['best_target_accuracy']
-                best_experiment = result['experiment_name']
+        # 2. 샘플 수별 결과 시각화
+        self._plot_sample_sizes_results(viz_dir)
         
-        print("-" * 100)
-        print(f"🏆 최고 성능: {best_experiment} ({best_accuracy:.2f}%)")
-        print(f"⏱️ 총 실행시간: {total_time:.1f}초 ({total_time/60:.1f}분)")
-        print(f"📁 상세 결과: {self.results_dir}/")
+        # 3. 하이퍼파라미터 히트맵
+        self._plot_hyperparameter_heatmap(viz_dir)
+        
+        # 4. 언러닝 효과 시각화
+        self._plot_unlearning_effects(viz_dir)
+        
+        print(f"✅ 시각화 완료! 저장 위치: {viz_dir}")
     
-    def save_comprehensive_report(self):
-        """종합 보고서 저장"""
+    def _plot_domain_pairs_results(self, viz_dir: Path) -> None:
+        """도메인 쌍 결과 시각화"""
+        try:
+            with open(self.results_dir / "domain_pairs_results.json", 'r') as f:
+                results = json.load(f)
+            
+            # 성공한 실험만 필터링
+            successful_results = [r for r in results if r.get('success', False)]
+            
+            if not successful_results:
+                print("⚠️ 성공한 도메인 쌍 실험 결과가 없음")
+                return
+            
+            # 데이터 준비
+            domain_pairs = [f"{r['source_domain']} → {r['target_domain']}" for r in successful_results]
+            final_accs = [r.get('final_target_acc', 0) for r in successful_results]
+            improvements = [r.get('improvement', 0) for r in successful_results]
+            
+            # 시각화
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # 최종 성능
+            ax1.bar(range(len(domain_pairs)), final_accs, color='skyblue')
+            ax1.set_title('Office31 Domain Pairs Final Performance')
+            ax1.set_xlabel('Domain Pairs')
+            ax1.set_ylabel('Target Accuracy (%)')
+            ax1.set_xticks(range(len(domain_pairs)))
+            ax1.set_xticklabels(domain_pairs, rotation=45)
+            
+            # 성능 개선
+            colors = ['green' if imp > 0 else 'red' for imp in improvements]
+            ax2.bar(range(len(domain_pairs)), improvements, color=colors)
+            ax2.set_title('Office31 Domain Pairs Performance Improvement')
+            ax2.set_xlabel('Domain Pairs')
+            ax2.set_ylabel('Performance Improvement (%)')
+            ax2.set_xticks(range(len(domain_pairs)))
+            ax2.set_xticklabels(domain_pairs, rotation=45)
+            ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "domain_pairs_performance.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 도메인 쌍 시각화 실패: {e}")
+    
+    def _plot_sample_sizes_results(self, viz_dir: Path) -> None:
+        """샘플 수별 결과 시각화"""
+        try:
+            with open(self.results_dir / "sample_sizes_results.json", 'r') as f:
+                results = json.load(f)
+            
+            successful_results = [r for r in results if r.get('success', False)]
+            
+            if not successful_results:
+                print("⚠️ 성공한 샘플 수 실험 결과가 없음")
+                return
+            
+            # 데이터 준비
+            sample_sizes = [r['num_samples'] for r in successful_results]
+            final_accs = [r.get('final_target_acc', 0) for r in successful_results]
+            improvements = [r.get('improvement', 0) for r in successful_results]
+            unlearning_counts = [r.get('unlearning_count', 0) for r in successful_results]
+            
+            # 시각화
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+            
+            # 최종 성능 vs 샘플 수
+            ax1.plot(sample_sizes, final_accs, 'o-', color='blue', linewidth=2, markersize=8)
+            ax1.set_title('Final Performance vs Target Sample Size')
+            ax1.set_xlabel('Target Sample Size')
+            ax1.set_ylabel('Target Accuracy (%)')
+            ax1.grid(True, alpha=0.3)
+            
+            # 성능 개선 vs 샘플 수
+            ax2.plot(sample_sizes, improvements, 'o-', color='green', linewidth=2, markersize=8)
+            ax2.set_title('Performance Improvement vs Target Sample Size')
+            ax2.set_xlabel('Target Sample Size')
+            ax2.set_ylabel('Performance Improvement (%)')
+            ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+            ax2.grid(True, alpha=0.3)
+            
+            # 언러닝 횟수 vs 샘플 수
+            ax3.bar(sample_sizes, unlearning_counts, color='orange', alpha=0.7)
+            ax3.set_title('Unlearning Count vs Target Sample Size')
+            ax3.set_xlabel('Target Sample Size')
+            ax3.set_ylabel('Unlearning Count')
+            ax3.grid(True, alpha=0.3)
+            
+            # 효율성 (개선/샘플수)
+            efficiency = [imp/size*100 for imp, size in zip(improvements, sample_sizes)]
+            ax4.plot(sample_sizes, efficiency, 'o-', color='purple', linewidth=2, markersize=8)
+            ax4.set_title('Sample Efficiency (Improvement/Size × 100)')
+            ax4.set_xlabel('Target Sample Size')
+            ax4.set_ylabel('Efficiency')
+            ax4.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "sample_sizes_analysis.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 샘플 수 시각화 실패: {e}")
+    
+    def _plot_hyperparameter_heatmap(self, viz_dir: Path) -> None:
+        """하이퍼파라미터 히트맵"""
+        try:
+            with open(self.results_dir / "hyperparameter_results.json", 'r') as f:
+                results = json.load(f)
+            
+            successful_results = [r for r in results if r.get('success', False)]
+            
+            if not successful_results:
+                print("⚠️ 성공한 하이퍼파라미터 실험 결과가 없음")
+                return
+            
+            # 데이터 준비
+            df = pd.DataFrame(successful_results)
+            pivot_final = df.pivot(index='beta_uncertainty', columns='lambda_utility', values='final_target_acc')
+            pivot_improvement = df.pivot(index='beta_uncertainty', columns='lambda_utility', values='improvement')
+            
+            # 시각화
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # 최종 성능 히트맵
+            sns.heatmap(pivot_final, annot=True, cmap='Blues', ax=ax1, fmt='.2f')
+            ax1.set_title('Hyperparameter Final Performance (%)')
+            ax1.set_xlabel('λ_u (Utility Weight)')
+            ax1.set_ylabel('β (Uncertainty Weight)')
+            
+            # 성능 개선 히트맵
+            sns.heatmap(pivot_improvement, annot=True, cmap='RdYlGn', center=0, ax=ax2, fmt='.2f')
+            ax2.set_title('Hyperparameter Performance Improvement (%)')
+            ax2.set_xlabel('λ_u (Utility Weight)')
+            ax2.set_ylabel('β (Uncertainty Weight)')
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "hyperparameter_heatmap.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 하이퍼파라미터 시각화 실패: {e}")
+    
+    def _plot_unlearning_effects(self, viz_dir: Path) -> None:
+        """언러닝 효과 시각화"""
+        try:
+            # 모든 실험 결과에서 언러닝 효과 분석
+            all_results = []
+            
+            for file_name in ["domain_pairs_results.json", "sample_sizes_results.json", "hyperparameter_results.json"]:
+                file_path = self.results_dir / file_name
+                if file_path.exists():
+                    with open(file_path, 'r') as f:
+                        results = json.load(f)
+                        all_results.extend([r for r in results if r.get('success', False)])
+            
+            if not all_results:
+                print("⚠️ 언러닝 효과 분석할 데이터 없음")
+                return
+            
+            # 데이터 준비
+            unlearning_counts = [r.get('unlearning_count', 0) for r in all_results]
+            improvements = [r.get('improvement', 0) for r in all_results]
+            
+            # 언러닝 횟수별 그룹화
+            unlearning_groups = {}
+            for count, improvement in zip(unlearning_counts, improvements):
+                if count not in unlearning_groups:
+                    unlearning_groups[count] = []
+                unlearning_groups[count].append(improvement)
+            
+            # 시각화
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # 언러닝 횟수 vs 성능 개선 산점도
+            ax1.scatter(unlearning_counts, improvements, alpha=0.6, s=50)
+            ax1.set_title('Unlearning Count vs Performance Improvement')
+            ax1.set_xlabel('Unlearning Count')
+            ax1.set_ylabel('Performance Improvement (%)')
+            ax1.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+            ax1.grid(True, alpha=0.3)
+            
+            # 언러닝 횟수별 평균 개선량
+            counts = sorted(unlearning_groups.keys())
+            avg_improvements = [np.mean(unlearning_groups[count]) for count in counts]
+            
+            ax2.bar(counts, avg_improvements, color='lightgreen', alpha=0.7)
+            ax2.set_title('Average Performance Improvement by Unlearning Count')
+            ax2.set_xlabel('Unlearning Count')
+            ax2.set_ylabel('Average Performance Improvement (%)')
+            ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "unlearning_effects.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 언러닝 효과 시각화 실패: {e}")
+    
+    def generate_summary_report(self) -> None:
+        """종합 결과 리포트 생성"""
+        print(f"\n📋 종합 결과 리포트 생성 중...")
         
-        report = {
-            'experiment_info': {
-                'total_experiments': len(self.all_results),
-                'timestamp': datetime.now().isoformat(),
-                'framework': 'SDA-U Office-31 Full Domain Adaptation',
-                'domain_combinations': len(self.domain_combinations)
-            },
-            'performance_summary': [],
-            'detailed_results': self.all_results
-        }
+        report = []
+        report.append("# Office31 SDA-U 종합 실험 리포트\n")
+        report.append(f"생성 시간: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         
-        # 성능 요약 추가
-        for result in self.all_results:
-            perf = self.extract_performance_summary(result['result_data'])
-            report['performance_summary'].append({
-                'experiment_name': result['experiment_name'],
-                'source_dataset': result['source_dataset'],
-                'target_dataset': result['target_dataset'],
-                'description': result['description'],
-                'performance': perf
-            })
+        # 각 실험별 요약
+        for experiment_name, file_name in [
+            ("도메인 쌍 실험", "domain_pairs_results.json"),
+            ("샘플 수 실험", "sample_sizes_results.json"),
+            ("하이퍼파라미터 실험", "hyperparameter_results.json")
+        ]:
+            file_path = self.results_dir / file_name
+            if file_path.exists():
+                with open(file_path, 'r') as f:
+                    results = json.load(f)
+                
+                successful = [r for r in results if r.get('success', False)]
+                total = len(results)
+                success_rate = len(successful) / total * 100 if total > 0 else 0
+                
+                report.append(f"## {experiment_name}\n")
+                report.append(f"- 총 실험: {total}개\n")
+                report.append(f"- 성공: {len(successful)}개 ({success_rate:.1f}%)\n")
+                
+                if successful:
+                    avg_improvement = np.mean([r.get('improvement', 0) for r in successful])
+                    max_improvement = max([r.get('improvement', 0) for r in successful])
+                    avg_unlearning = np.mean([r.get('unlearning_count', 0) for r in successful])
+                    
+                    report.append(f"- 평균 성능 개선: {avg_improvement:.2f}%\n")
+                    report.append(f"- 최대 성능 개선: {max_improvement:.2f}%\n")
+                    report.append(f"- 평균 언러닝 횟수: {avg_unlearning:.1f}회\n")
+                
+                report.append("\n")
         
-        # 종합 보고서 저장
-        report_file = self.results_dir / 'office31_comprehensive_report.json'
+        # 리포트 저장
+        report_file = self.results_dir / "comprehensive_report.md"
         with open(report_file, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+            f.writelines(report)
         
-        print(f"📋 종합 보고서 저장: {report_file}")
-    
-    def run_all_experiments(self):
-        """모든 도메인 조합에 대해 실험 실행"""
-        
-        print("🏢 Office-31 전체 도메인 조합 SDA-U 실험 시작!")
-        print(f"📊 총 {len(self.domain_combinations)}개 실험 예정")
-        print(f"📁 결과 저장 위치: {self.results_dir}/")
-        
-        start_time = time.time()
-        successful_experiments = 0
-        
-        for i, (source, target, description) in enumerate(self.domain_combinations, 1):
-            print(f"\n🔢 진행상황: {i}/{len(self.domain_combinations)}")
-            
-            success, result_data = self.run_single_experiment(source, target, description)
-            
-            if success:
-                successful_experiments += 1
-                print(f"✅ {i}번째 실험 성공!")
-            else:
-                print(f"❌ {i}번째 실험 실패!")
-            
-            # 중간 결과 저장 (실험이 중단되어도 결과 보존)
-            if self.all_results:
-                self.create_performance_table()
-        
-        end_time = time.time()
-        total_time = end_time - start_time
-        
-        print(f"\n{'='*80}")
-        print("🎉 Office-31 전체 실험 완료!")
-        print(f"✅ 성공한 실험: {successful_experiments}/{len(self.domain_combinations)}")
-        print(f"⏱️ 총 소요시간: {total_time:.1f}초 ({total_time/60:.1f}분)")
-        print(f"{'='*80}")
-        
-        # 최종 결과 정리
-        if self.all_results:
-            self.print_performance_summary()
-            self.create_performance_table()
-            self.save_comprehensive_report()
-        else:
-            print("❌ 성공한 실험이 없습니다.")
+        print(f"✅ 종합 리포트 생성 완료: {report_file}")
 
 def main():
     """메인 함수"""
+    parser = argparse.ArgumentParser(description='Office31 종합 실험 도구')
+    parser.add_argument('--experiment', type=str, 
+                       choices=['domain_pairs', 'sample_sizes', 'hyperparams', 'all'],
+                       default='all', help='실행할 실험 종류')
+    parser.add_argument('--config', type=str, default='config.json', help='기본 설정 파일')
+    parser.add_argument('--visualize', action='store_true', help='시각화 생성')
     
-    print("🏢 Office-31 전체 도메인 조합 SDA-U 실험")
-    print("=" * 60)
+    args = parser.parse_args()
     
-    # 실험 관리자 생성
-    experiment_manager = Office31FullExperiments()
+    print("🎯 Office31 종합 실험 도구 시작!")
+    print("="*60)
     
-    print("\n실행할 작업을 선택하세요:")
-    print("1. 전체 실험 실행 (6개 도메인 조합)")
-    print("2. 개별 실험 선택")
-    print("3. 기존 결과 분석")
+    # 실험 러너 초기화
+    runner = Office31ExperimentRunner(args.config)
     
-    try:
-        choice = input("\n선택 (1-3): ").strip()
-        
-        if choice == "1":
-            # 전체 실험 실행
-            print("\n⚠️ 전체 실험은 시간이 오래 걸릴 수 있습니다.")
-            confirm = input("계속하시겠습니까? (y/n): ").lower()
-            if confirm == 'y':
-                experiment_manager.run_all_experiments()
-            else:
-                print("실험을 취소했습니다.")
-                
-        elif choice == "2":
-            # 개별 실험 선택
-            print("\n도메인 조합을 선택하세요:")
-            for i, (source, target, desc) in enumerate(experiment_manager.domain_combinations, 1):
-                print(f"{i}. {desc}")
-            
-            exp_choice = int(input(f"\n선택 (1-{len(experiment_manager.domain_combinations)}): ")) - 1
-            if 0 <= exp_choice < len(experiment_manager.domain_combinations):
-                source, target, description = experiment_manager.domain_combinations[exp_choice]
-                success, result_data = experiment_manager.run_single_experiment(source, target, description)
-                
-                if success:
-                    print("✅ 실험 완료!")
-                    experiment_manager.print_performance_summary()
-                else:
-                    print("❌ 실험 실패!")
-            else:
-                print("❌ 잘못된 선택입니다.")
-                
-        elif choice == "3":
-            # 기존 결과 분석
-            results_dir = Path('office31_results')
-            if results_dir.exists():
-                result_files = list(results_dir.glob('*_results.json'))
-                if result_files:
-                    print(f"\n📊 발견된 결과 파일: {len(result_files)}개")
-                    
-                    # 기존 결과 로드
-                    for result_file in result_files:
-                        try:
-                            with open(result_file, 'r', encoding='utf-8') as f:
-                                result_data = json.load(f)
-                            
-                            exp_info = result_data.get('experiment_info', {})
-                            experiment_manager.all_results.append({
-                                'experiment_name': exp_info.get('experiment_name', 'Unknown'),
-                                'source_dataset': exp_info.get('source_dataset', 'Unknown'),
-                                'target_dataset': exp_info.get('target_dataset', 'Unknown'),
-                                'description': exp_info.get('description', 'Unknown'),
-                                'execution_time': exp_info.get('execution_time_seconds', 0),
-                                'result_data': result_data
-                            })
-                        except Exception as e:
-                            print(f"⚠️ {result_file} 로드 실패: {e}")
-                    
-                    if experiment_manager.all_results:
-                        experiment_manager.print_performance_summary()
-                        experiment_manager.create_performance_table()
-                    else:
-                        print("❌ 유효한 결과를 찾을 수 없습니다.")
-                else:
-                    print("❌ 결과 파일을 찾을 수 없습니다.")
-            else:
-                print("❌ 결과 디렉토리가 없습니다.")
-        else:
-            print("❌ 잘못된 선택입니다.")
-            
-    except KeyboardInterrupt:
-        print("\n⚠️ 사용자에 의해 중단되었습니다.")
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
+    # 실험 실행
+    if args.experiment == 'domain_pairs' or args.experiment == 'all':
+        runner.run_domain_pairs_experiment()
+    
+    if args.experiment == 'sample_sizes' or args.experiment == 'all':
+        runner.run_sample_sizes_experiment()
+    
+    if args.experiment == 'hyperparams' or args.experiment == 'all':
+        runner.run_hyperparameter_experiment()
+    
+    # 시각화 및 리포트 생성
+    if args.visualize or args.experiment == 'all':
+        runner.create_visualizations()
+    
+    runner.generate_summary_report()
+    
+    print("\n🎉 Office31 종합 실험 완료!")
+    print(f"📂 결과 확인: {runner.results_dir}")
 
 if __name__ == "__main__":
     main() 

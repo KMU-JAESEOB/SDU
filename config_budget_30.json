@@ -1,0 +1,98 @@
+{
+  "experiment": {
+    "name": "SDA-U High Budget Experiment (30%)",
+    "version": "2.0.0",
+    "description": "타겟 샘플 30% 사용 실험"
+  },
+  
+  "model": {
+    "architecture": "resnet50",
+    "pretrained": true,
+    "num_classes": {
+      "Office31": 31,
+      "OfficeHome": 65
+    }
+  },
+  
+  "training": {
+    "batch_size": 32,
+    "learning_rate": 2e-4,
+    "weight_decay": 1e-4,
+    "max_epochs": 500,
+    "patience": 30,
+    "epoch_chunk_size": 10,
+    "gradient_clip_norm": 1.0
+  },
+  
+  "target_selection": {
+    "budget_percent": 30,
+    "selection_method": "balanced_uncertainty",
+    "uncertainty_threshold": 0.5,
+    "min_samples_per_class": 1
+  },
+  
+  "influence_calculation": {
+    "method": "hessian_lissa",
+    "num_samples": 200,
+    "damping": 0.01,
+    "lissa_iterations": 10,
+    "max_influence_samples": 50
+  },
+  
+  "unlearning": {
+    "method": "gentle_dos",
+    "num_steps": 5,
+    "learning_rate": 5e-6,
+    "gentle_factor": 0.3,
+    "projection_conservative": 0.8,
+    "performance_drop_threshold": 5.0,
+    "orthogonal_projection": true
+  },
+  
+  "paths": {
+    "data_root": "./data",
+    "model_save_dir": "./models",
+    "results_dir": "./results",
+    "source_models_dir": "./models/source_models",
+    "logs_dir": "./logs"
+  },
+  
+  "datasets": {
+    "Office31": {
+      "domains": ["Amazon", "Webcam", "DSLR"],
+      "num_classes": 31,
+      "download_url": "https://drive.google.com/uc?id=0B4IapRTv9pJ1WGZVd1VDMmhwdlE"
+    },
+    "OfficeHome": {
+      "domains": ["Art", "Clipart", "Product", "Real World"],
+      "num_classes": 65,
+      "download_url": "https://drive.google.com/uc?id=0B81rNlvomiwed0V1YUxQdC1uOTg"
+    }
+  },
+  
+  "performance": {
+    "evaluation_batch_limit": 20,
+    "save_best_model": true,
+    "save_performance_history": true,
+    "log_interval": 5,
+    "early_stopping": {
+      "enabled": true,
+      "patience": 4,
+      "min_epochs": 3
+    }
+  },
+  
+  "gpu": {
+    "auto_optimize": true,
+    "mixed_precision": false,
+    "benchmark": true,
+    "deterministic": false
+  },
+  
+  "logging": {
+    "level": "INFO",
+    "flush_output": true,
+    "save_logs": true,
+    "progress_bar": true
+  }
+} 

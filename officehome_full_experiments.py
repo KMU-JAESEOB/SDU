@@ -1,387 +1,624 @@
-# officehome_full_experiments.py
+#!/usr/bin/env python3
+# officehome_full_experiments.py - OfficeHome 종합 실험 도구
+
 """
-🏠 Office-Home 전체 도메인 조합 실험 시스템
-- 4개 도메인: Art, Clipart, Product, Real World
-- 12개 도메인 조합 (4×3 = 12)
-- SDA-U 알고리즘 적용
+🎯 OfficeHome 종합 실험 도구
+
+기능:
+1. 모든 소스-타겟 도메인 조합 실험 (4x3=12개 조합)
+2. 타겟 샘플 수별 성능 비교 (100~600개)
+3. λ_u, β 하이퍼파라미터 그리드 서치
+4. 언러닝 효과 시각화
+
+사용법:
+python officehome_full_experiments.py --experiment [domain_pairs|sample_sizes|hyperparams|all]
 """
 
 import os
 import sys
 import json
+import copy
 import time
-import pandas as pd
-from datetime import datetime
-from pathlib import Path
-import subprocess
 import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple, Any
+import subprocess
+
+# 시각화를 위한 라이브러리
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    import seaborn as sns
+    import matplotlib.font_manager as fm
+    
+    # Suppress warnings
+    import warnings
+    warnings.filterwarnings('ignore')
+    
+    # 한글 폰트 설정 (에러 방지)
+    try:
+        # 사용 가능한 한글 폰트 찾기
+        font_list = [f.name for f in fm.fontManager.ttflist]
+        korean_fonts = ['Malgun Gothic', 'AppleGothic', 'NanumGothic', 'Arial Unicode MS']
+        available_korean_font = None
+        
+        for font in korean_fonts:
+            if font in font_list:
+                available_korean_font = font
+                break
+        
+        if available_korean_font:
+            plt.rcParams['font.family'] = [available_korean_font, 'DejaVu Sans']
+        else:
+            # 한글 폰트가 없으면 영어만 사용
+            plt.rcParams['font.family'] = ['DejaVu Sans']
+            
+        plt.rcParams['axes.unicode_minus'] = False
+    except:
+        # 폰트 설정 실패 시 기본값 유지
+        pass
+    
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    print("⚠️ 시각화 라이브러리 없음. pip install matplotlib seaborn pandas 실행하세요.")
+
+# main.py의 SDAUAlgorithm 클래스 import
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+try:
+    from main import SDAUAlgorithm, SDAUConfig
+    MAIN_AVAILABLE = True
+except ImportError:
+    MAIN_AVAILABLE = False
+    print("⚠️ main.py import 실패. 환경 설정 문제일 수 있습니다.")
 
 class OfficeHomeExperimentRunner:
-    """Office-Home 전체 실험 실행기"""
+    """OfficeHome 종합 실험 실행기"""
     
-    def __init__(self, base_config=None):
-        """
-        Args:
-            base_config (dict): 기본 설정 (옵션)
-        """
-        self.domains = ['art', 'clipart', 'product', 'real_world']
-        self.domain_names = {
-            'art': 'Art',
-            'clipart': 'Clipart', 
-            'product': 'Product',
-            'real_world': 'Real World'
-        }
-        
-        # 기본 설정
-        self.base_config = base_config or self._get_default_config()
-        
-        # 결과 저장 경로
-        self.results_dir = Path('results/officehome')
+    def __init__(self, base_config_path: str = "config.json"):
+        self.base_config_path = base_config_path
+        self.results_dir = Path("results/officehome_comprehensive")
         self.results_dir.mkdir(parents=True, exist_ok=True)
         
-        # 모델 저장 경로
-        self.models_dir = Path('models/officehome')
-        self.models_dir.mkdir(parents=True, exist_ok=True)
+        # OfficeHome 도메인 정의 (4개 도메인)
+        # 로더에서 사용하는 소문자 도메인 이름 사용
+        self.domains = ["art", "clipart", "product", "real_world"]
+        self.domain_pairs = [(s, t) for s in self.domains for t in self.domains if s != t]
         
-        print("🏠 Office-Home 실험 러너 초기화 완료!")
-        print(f"📁 결과 저장: {self.results_dir}")
-        print(f"💾 모델 저장: {self.models_dir}")
-    
-    def _get_default_config(self):
-        """기본 실험 설정"""
-        
-        return {
-            # 데이터셋 설정
-            'dataset': 'OfficeHome',
-            'data_root': './data',
-            'num_classes': 65,
-            'image_size': 224,
-            'channels': 3,
-            
-            # 훈련 설정
-            'num_epochs': 15,
-            'adaptation_epochs': 10,
-            'batch_size': 32,
-            'learning_rate': 2e-4,
-            'weight_decay': 1e-4,
-            
-            # SDA-U 설정
-            'influence_samples': 500,  # Office-Home은 더 많은 샘플
-            'unlearn_ratio': 0.25,
-            'max_unlearn_samples': 200,
-            'dos_steps': 8,
-            'target_samples': 800,  # Office-Home은 더 많은 타겟 샘플
-            
-            # 모델 설정
-            'architecture': 'resnet50',  # Office-Home은 더 복잡한 모델 사용
-            'pretrained': True,
-            'use_scheduler': True,
-            'gradient_clipping': 1.0,
-            
-            # GPU 설정
-            'device': 'cuda',
-            'mixed_precision': True,
-            'pin_memory': True,
-            'num_workers': 4
+        # 표시용 도메인 이름 매핑
+        self.domain_display_names = {
+            "art": "Art",
+            "clipart": "Clipart", 
+            "product": "Product",
+            "real_world": "Real World"
         }
+        
+        # 실험 설정
+        self.sample_sizes = [100, 200, 300, 400, 500, 600]
+        self.lambda_values = [0.5, 0.6, 0.7, 0.8, 0.9]
+        self.beta_values = [0.1, 0.2, 0.3, 0.4, 0.5]
+        
+        print(f"🎯 OfficeHome 종합 실험 초기화 완료")
+        print(f"📂 결과 저장: {self.results_dir}")
+        display_names = [self.domain_display_names[d] for d in self.domains]
+        print(f"🏠 도메인: {', '.join(display_names)} (총 {len(self.domain_pairs)}개 조합)")
     
-    def get_domain_combinations(self):
-        """모든 도메인 조합 생성"""
+    def create_experiment_config(self, modifications: Dict[str, Any]) -> str:
+        """실험용 설정 파일 생성"""
+        # 기본 설정 로딩
+        with open(self.base_config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
         
-        combinations = []
-        for source in self.domains:
-            for target in self.domains:
-                if source != target:
-                    combinations.append((source, target))
+        # 수정사항 적용
+        for key_path, value in modifications.items():
+            keys = key_path.split('.')
+            current = config
+            for key in keys[:-1]:
+                current = current[key]
+            current[keys[-1]] = value
         
-        return combinations
+        # 임시 설정 파일 생성
+        temp_config_path = self.results_dir / f"temp_config_{int(time.time())}.json"
+        with open(temp_config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        
+        return str(temp_config_path)
     
-    def create_experiment_config(self, source_domain, target_domain):
-        """특정 도메인 조합을 위한 실험 설정 생성"""
-        
-        config = self.base_config.copy()
-        
-        # 도메인 설정
-        config['source_domain'] = source_domain
-        config['target_domain'] = target_domain
-        config['source_name'] = self.domain_names[source_domain]
-        config['target_name'] = self.domain_names[target_domain]
-        
-        # 실험 이름
-        experiment_name = f"{config['source_name']}2{config['target_name']}"
-        config['experiment_name'] = experiment_name
-        
-        # 파일 경로
-        config['model_save_dir'] = str(self.models_dir / experiment_name)
-        config['results_file'] = str(self.results_dir / f"{experiment_name}_results.json")
-        config['log_file'] = str(self.results_dir / f"{experiment_name}_log.txt")
-        
-        return config
-    
-    def run_single_experiment(self, source_domain, target_domain, verbose=True):
-        """단일 도메인 조합 실험 실행"""
-        
-        config = self.create_experiment_config(source_domain, target_domain)
-        experiment_name = config['experiment_name']
-        
-        if verbose:
-            print(f"\n{'='*80}")
-            print(f"🚀 실험 시작: {experiment_name}")
-            print(f"📊 소스 도메인: {config['source_name']} ({source_domain})")
-            print(f"🎯 타겟 도메인: {config['target_name']} ({target_domain})")
-            print(f"{'='*80}")
-        
-        start_time = time.time()
+    def run_single_experiment(self, source_domain: str, target_domain: str, 
+                            config_path: str, experiment_name: str) -> Dict[str, Any]:
+        """단일 실험 실행"""
+        print(f"🔬 실험 시작: {experiment_name} ({source_domain} → {target_domain})")
         
         try:
-            # main.py 실행 명령어 구성
-            cmd = [
-                sys.executable, 'main.py',
-                '--dataset', 'OfficeHome',
-                '--source_domain', source_domain,
-                '--target_domain', target_domain,
-                '--num_epochs', str(config['num_epochs']),
-                '--adaptation_epochs', str(config['adaptation_epochs']),
-                '--batch_size', str(config['batch_size']),
-                '--learning_rate', str(config['learning_rate']),
-                '--influence_samples', str(config['influence_samples']),
-                '--target_samples', str(config['target_samples']),
-                '--model_save_dir', config['model_save_dir'],
-                '--results_file', config['results_file']
-            ]
-            
-            # 로그 파일로 출력 리다이렉션 + 실시간 출력
-            with open(config['log_file'], 'w', encoding='utf-8') as log_file:
-                if verbose:
-                    print(f"📝 로그 파일: {config['log_file']}")
-                    print(f"🚀 실험 실행 중... (실시간 진행 상황은 로그 파일 참조)")
-                    print(f"📊 예상 소요 시간: Art 도메인 ~15-20분, 타 도메인 ~20-30분")
-                    print(f"💡 진행 확인: tail -f {config['log_file']}")
+            if MAIN_AVAILABLE:
+                # 직접 실행 방식
+                sda_u = SDAUAlgorithm(config_path=config_path)
+                # 도메인 이름을 소문자로 변환하여 전달
+                results = sda_u.run_experiment("OfficeHome", source_domain.lower(), target_domain.lower())
                 
-                # 실험 실행
-                result = subprocess.run(
-                    cmd, 
-                    stdout=log_file, 
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    cwd=os.getcwd()
-                )
-            
-            # 실행 시간 계산
-            elapsed_time = time.time() - start_time
-            
-            if result.returncode == 0:
-                if verbose:
-                    print(f"✅ 실험 완료: {experiment_name}")
-                    print(f"⏱️ 실행 시간: {elapsed_time/60:.1f}분")
+                return {
+                    'source_domain': source_domain,
+                    'target_domain': target_domain,
+                    'experiment_name': experiment_name,
+                    'initial_target_acc': results.initial_target_acc,
+                    'final_target_acc': results.final_target_acc,
+                    'best_target_acc': results.best_target_acc,
+                    'best_epoch': results.best_epoch,
+                    'improvement': results.improvement,
+                    'best_improvement': results.best_improvement,
+                    'unlearning_count': results.unlearning_count,
+                    'total_epochs': results.total_epochs,
+                    'success': True,
+                    'timestamp': time.time()
+                }
+            else:
+                # subprocess 실행 방식
+                cmd = [
+                    sys.executable, 'main.py',
+                    '--dataset', 'OfficeHome',
+                    '--source_domain', source_domain.lower(),
+                    '--target_domain', target_domain.lower(),
+                    '--config', config_path,
+                    '--results_file', f'{experiment_name}_results.json'
+                ]
                 
-                # 결과 로드 및 반환
-                if os.path.exists(config['results_file']):
-                    with open(config['results_file'], 'r', encoding='utf-8') as f:
-                        results = json.load(f)
-                    results['elapsed_time'] = elapsed_time
-                    return results
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)  # 2시간 제한
+                
+                if result.returncode == 0:
+                    print(f"✅ 성공: {experiment_name}")
+                    return {
+                        'source_domain': source_domain,
+                        'target_domain': target_domain,
+                        'experiment_name': experiment_name,
+                        'success': True,
+                        'timestamp': time.time()
+                    }
                 else:
-                    print(f"⚠️ 결과 파일을 찾을 수 없음: {config['results_file']}")
-                    return {'error': 'results_file_not_found', 'elapsed_time': elapsed_time}
-            else:
-                if verbose:
-                    print(f"❌ 실험 실패: {experiment_name}")
-                    print(f"💥 종료 코드: {result.returncode}")
-                    print(f"📝 로그 확인: {config['log_file']}")
-                
-                return {'error': f'experiment_failed_code_{result.returncode}', 'elapsed_time': elapsed_time}
-        
+                    print(f"❌ 실패: {experiment_name}")
+                    return {
+                        'source_domain': source_domain,
+                        'target_domain': target_domain,
+                        'experiment_name': experiment_name,
+                        'success': False,
+                        'error': result.stderr,
+                        'timestamp': time.time()
+                    }
+                    
         except Exception as e:
-            elapsed_time = time.time() - start_time
-            if verbose:
-                print(f"💥 예외 발생: {experiment_name}")
-                print(f"❌ 오류: {str(e)}")
-            
-            return {'error': str(e), 'elapsed_time': elapsed_time}
+            print(f"❌ 오류: {experiment_name} - {e}")
+            return {
+                'source_domain': source_domain,
+                'target_domain': target_domain,
+                'experiment_name': experiment_name,
+                'success': False,
+                'error': str(e),
+                'timestamp': time.time()
+            }
     
-    def run_all_experiments(self, skip_existing=True, max_parallel=1):
-        """모든 도메인 조합 실험 실행"""
+    def run_domain_pairs_experiment(self) -> Dict[str, Any]:
+        """모든 도메인 쌍 실험"""
+        print(f"\n🎯 OfficeHome 도메인 쌍 실험 시작 (총 {len(self.domain_pairs)}개)")
         
-        combinations = self.get_domain_combinations()
-        total_experiments = len(combinations)
-        
-        print(f"\n🏠 Office-Home 전체 실험 시작!")
-        print(f"📊 총 실험 수: {total_experiments}개")
-        print(f"🔄 도메인 조합: {len(self.domains)}개 도메인 × {len(self.domains)-1}개 타겟")
-        print(f"⚡ 병렬 실행: {max_parallel}개")
-        print(f"⏭️ 기존 결과 건너뛰기: {skip_existing}")
-        
-        # 전체 결과 저장
-        all_results = {}
-        successful_experiments = 0
-        failed_experiments = 0
-        skipped_experiments = 0
-        
-        start_time = time.time()
-        
-        for i, (source, target) in enumerate(combinations, 1):
-            experiment_name = f"{self.domain_names[source]}2{self.domain_names[target]}"
+        results = []
+        for i, (source, target) in enumerate(self.domain_pairs, 1):
+            print(f"\n진행률: {i}/{len(self.domain_pairs)}")
             
-            print(f"\n[{i}/{total_experiments}] {experiment_name}")
+            # 기본 설정으로 실험
+            config_path = self.create_experiment_config({})
+            experiment_name = f"domain_pairs_{source}2{target}"
             
-            # 기존 결과 확인
-            results_file = self.results_dir / f"{experiment_name}_results.json"
-            if skip_existing and results_file.exists():
-                print(f"⏭️ 기존 결과 존재, 건너뛰기: {results_file}")
+            result = self.run_single_experiment(source, target, config_path, experiment_name)
+            results.append(result)
+            
+            # 임시 설정 파일 삭제
+            os.remove(config_path)
+        
+        # 결과 저장
+        output_file = self.results_dir / "domain_pairs_results.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ OfficeHome 도메인 쌍 실험 완료! 결과: {output_file}")
+        return {'results': results, 'output_file': str(output_file)}
+    
+    def run_sample_sizes_experiment(self) -> Dict[str, Any]:
+        """타겟 샘플 수별 실험"""
+        print(f"\n📊 OfficeHome 타겟 샘플 수별 실험 시작")
+        print(f"샘플 크기: {self.sample_sizes}")
+        
+        results = []
+        # 대표적인 도메인 쌍 선택 (Art → Clipart)
+        source, target = "Art", "Clipart"
+        
+        for i, num_samples in enumerate(self.sample_sizes, 1):
+            print(f"\n진행률: {i}/{len(self.sample_sizes)} - 샘플 {num_samples}개")
+            
+            # 타겟 샘플 수 설정
+            config_path = self.create_experiment_config({
+                'target_selection.num_samples': num_samples
+            })
+            
+            experiment_name = f"sample_sizes_{num_samples}"
+            result = self.run_single_experiment(source, target, config_path, experiment_name)
+            result['num_samples'] = num_samples
+            results.append(result)
+            
+            # 임시 설정 파일 삭제
+            os.remove(config_path)
+        
+        # 결과 저장
+        output_file = self.results_dir / "sample_sizes_results.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ OfficeHome 샘플 수 실험 완료! 결과: {output_file}")
+        return {'results': results, 'output_file': str(output_file)}
+    
+    def run_hyperparameter_experiment(self) -> Dict[str, Any]:
+        """하이퍼파라미터 그리드 서치"""
+        print(f"\n🔍 OfficeHome 하이퍼파라미터 그리드 서치 시작")
+        print(f"λ_u 값: {self.lambda_values}")
+        print(f"β 값: {self.beta_values}")
+        print(f"총 조합: {len(self.lambda_values) * len(self.beta_values)}개")
+        
+        results = []
+        # 대표적인 도메인 쌍 선택 (Art → Product)
+        source, target = "Art", "Product"
+        
+        total_combinations = len(self.lambda_values) * len(self.beta_values)
+        current = 0
+        
+        for lambda_u in self.lambda_values:
+            for beta in self.beta_values:
+                current += 1
+                print(f"\n진행률: {current}/{total_combinations} - λ_u={lambda_u}, β={beta}")
                 
-                # 기존 결과 로드
-                try:
-                    with open(results_file, 'r', encoding='utf-8') as f:
-                        existing_results = json.load(f)
-                    all_results[experiment_name] = existing_results
-                    skipped_experiments += 1
-                    continue
-                except:
-                    print("⚠️ 기존 결과 파일 손상, 재실행")
-            
-            # 실험 실행
-            result = self.run_single_experiment(source, target, verbose=True)
-            all_results[experiment_name] = result
-            
-            if 'error' in result:
-                failed_experiments += 1
-            else:
-                successful_experiments += 1
-            
-            # 진행률 출력
-            progress = (i / total_experiments) * 100
-            print(f"📈 진행률: {progress:.1f}% ({i}/{total_experiments})")
+                # 하이퍼파라미터 설정
+                config_path = self.create_experiment_config({
+                    'target_selection.lambda_utility': lambda_u,
+                    'target_selection.beta_uncertainty': beta
+                })
+                
+                experiment_name = f"hyperparams_lu{lambda_u}_b{beta}"
+                result = self.run_single_experiment(source, target, config_path, experiment_name)
+                result['lambda_utility'] = lambda_u
+                result['beta_uncertainty'] = beta
+                results.append(result)
+                
+                # 임시 설정 파일 삭제
+                os.remove(config_path)
         
-        # 전체 실행 시간
-        total_elapsed = time.time() - start_time
+        # 결과 저장
+        output_file = self.results_dir / "hyperparameter_results.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
         
-        # 결과 요약
-        print(f"\n{'='*80}")
-        print(f"🏠 Office-Home 전체 실험 완료!")
-        print(f"{'='*80}")
-        print(f"⏱️ 총 실행 시간: {total_elapsed/3600:.1f}시간")
-        print(f"✅ 성공한 실험: {successful_experiments}개")
-        print(f"❌ 실패한 실험: {failed_experiments}개")
-        print(f"⏭️ 건너뛴 실험: {skipped_experiments}개")
-        print(f"📊 총 실험 수: {total_experiments}개")
-        
-        # 전체 결과 저장
-        summary_results = {
-            'timestamp': datetime.now().isoformat(),
-            'total_experiments': total_experiments,
-            'successful_experiments': successful_experiments,
-            'failed_experiments': failed_experiments,
-            'skipped_experiments': skipped_experiments,
-            'total_elapsed_time': total_elapsed,
-            'experiments': all_results
-        }
-        
-        summary_file = self.results_dir / 'officehome_full_results.json'
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            json.dump(summary_results, f, indent=2, ensure_ascii=False)
-        
-        print(f"💾 전체 결과 저장: {summary_file}")
-        
-        # 성능 요약 테이블 생성
-        self.create_performance_summary(all_results)
-        
-        return summary_results
+        print(f"✅ OfficeHome 하이퍼파라미터 실험 완료! 결과: {output_file}")
+        return {'results': results, 'output_file': str(output_file)}
     
-    def create_performance_summary(self, all_results):
-        """성능 요약 테이블 생성"""
+    def create_visualizations(self) -> None:
+        """실험 결과 시각화"""
+        if not VISUALIZATION_AVAILABLE:
+            print("⚠️ 시각화 라이브러리가 없어 건너뛰기")
+            return
         
-        print(f"\n📊 성능 요약 테이블 생성 중...")
+        print(f"\n📈 OfficeHome 시각화 생성 중...")
         
-        # 데이터 수집
-        summary_data = []
+        # 시각화 디렉토리 생성
+        viz_dir = self.results_dir / "visualizations"
+        viz_dir.mkdir(exist_ok=True)
         
-        for experiment_name, result in all_results.items():
-            if 'error' in result:
-                summary_data.append({
-                    'Experiment': experiment_name,
-                    'Source Domain': experiment_name.split('2')[0],
-                    'Target Domain': experiment_name.split('2')[1],
-                    'Final Target Accuracy': 'FAILED',
-                    'Overall Target Accuracy': 'FAILED',
-                    'Source Accuracy': 'FAILED',
-                    'Unlearned Samples': 'FAILED',
-                    'Selected Target Samples': 'FAILED',
-                    'Training Time (min)': f"{result.get('elapsed_time', 0)/60:.1f}",
-                    'Status': 'FAILED'
-                })
-            else:
-                summary_data.append({
-                    'Experiment': experiment_name,
-                    'Source Domain': experiment_name.split('2')[0],
-                    'Target Domain': experiment_name.split('2')[1],
-                    'Final Target Accuracy': f"{result.get('final_target_accuracy', 0):.2f}%",
-                    'Overall Target Accuracy': f"{result.get('overall_target_accuracy', 0):.2f}%",
-                    'Source Accuracy': f"{result.get('source_accuracy', 0):.2f}%",
-                    'Unlearned Samples': result.get('unlearned_samples', 0),
-                    'Selected Target Samples': result.get('selected_target_samples', 0),
-                    'Training Time (min)': f"{result.get('elapsed_time', 0)/60:.1f}",
-                    'Status': 'SUCCESS'
-                })
+        # 1. 도메인 쌍 결과 시각화
+        self._plot_domain_pairs_results(viz_dir)
         
-        # DataFrame 생성
-        df = pd.DataFrame(summary_data)
+        # 2. 샘플 수별 결과 시각화
+        self._plot_sample_sizes_results(viz_dir)
         
-        # CSV 저장
-        csv_file = self.results_dir / 'officehome_performance_summary.csv'
-        df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+        # 3. 하이퍼파라미터 히트맵
+        self._plot_hyperparameter_heatmap(viz_dir)
         
-        print(f"✅ CSV 요약 저장: {csv_file}")
+        # 4. 언러닝 효과 시각화
+        self._plot_unlearning_effects(viz_dir)
         
-        # 콘솔 출력
-        print(f"\n📊 Office-Home 성능 요약:")
-        print("="*120)
-        print(df.to_string(index=False))
-        print("="*120)
-        
-        # 통계 요약
-        successful_results = [r for r in all_results.values() if 'error' not in r]
-        if successful_results:
-            final_accuracies = [r.get('final_target_accuracy', 0) for r in successful_results]
-            overall_accuracies = [r.get('overall_target_accuracy', 0) for r in successful_results]
+        print(f"✅ OfficeHome 시각화 완료! 저장 위치: {viz_dir}")
+    
+    def _plot_domain_pairs_results(self, viz_dir: Path) -> None:
+        """도메인 쌍 결과 시각화"""
+        try:
+            with open(self.results_dir / "domain_pairs_results.json", 'r') as f:
+                results = json.load(f)
             
-            print(f"\n📈 성능 통계:")
-            print(f"   🎯 최종 타겟 정확도 - 평균: {sum(final_accuracies)/len(final_accuracies):.2f}%, 최고: {max(final_accuracies):.2f}%, 최저: {min(final_accuracies):.2f}%")
-            print(f"   📊 전체 타겟 정확도 - 평균: {sum(overall_accuracies)/len(overall_accuracies):.2f}%, 최고: {max(overall_accuracies):.2f}%, 최저: {min(overall_accuracies):.2f}%")
+            # 성공한 실험만 필터링
+            successful_results = [r for r in results if r.get('success', False)]
+            
+            if not successful_results:
+                print("⚠️ 성공한 도메인 쌍 실험 결과가 없음")
+                return
+            
+            # 데이터 준비
+            domain_pairs = [f"{self.domain_display_names.get(r['source_domain'], r['source_domain'])} → {self.domain_display_names.get(r['target_domain'], r['target_domain'])}" for r in successful_results]
+            final_accs = [r.get('final_target_acc', 0) for r in successful_results]
+            improvements = [r.get('improvement', 0) for r in successful_results]
+            
+            # 시각화
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+            
+            # 최종 성능
+            bars1 = ax1.bar(range(len(domain_pairs)), final_accs, color='lightcoral')
+            ax1.set_title('OfficeHome Domain Pairs Final Performance')
+            ax1.set_xlabel('Domain Pairs')
+            ax1.set_ylabel('Target Accuracy (%)')
+            ax1.set_xticks(range(len(domain_pairs)))
+            ax1.set_xticklabels(domain_pairs, rotation=45, ha='right')
+            
+            # 값 표시
+            for bar, acc in zip(bars1, final_accs):
+                height = bar.get_height()
+                ax1.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                        f'{acc:.1f}%', ha='center', va='bottom', fontsize=8)
+            
+            # 성능 개선
+            colors = ['green' if imp > 0 else 'red' for imp in improvements]
+            bars2 = ax2.bar(range(len(domain_pairs)), improvements, color=colors, alpha=0.7)
+            ax2.set_title('OfficeHome Domain Pairs Performance Improvement')
+            ax2.set_xlabel('Domain Pairs')
+            ax2.set_ylabel('Performance Improvement (%)')
+            ax2.set_xticks(range(len(domain_pairs)))
+            ax2.set_xticklabels(domain_pairs, rotation=45, ha='right')
+            ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+            
+            # 값 표시
+            for bar, imp in zip(bars2, improvements):
+                height = bar.get_height()
+                y_pos = height + 0.1 if height > 0 else height - 0.3
+                ax2.text(bar.get_x() + bar.get_width()/2., y_pos,
+                        f'{imp:+.1f}%', ha='center', va='bottom' if height > 0 else 'top', fontsize=8)
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "domain_pairs_performance.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 도메인 쌍 시각화 실패: {e}")
+    
+    def _plot_sample_sizes_results(self, viz_dir: Path) -> None:
+        """샘플 수별 결과 시각화"""
+        try:
+            with open(self.results_dir / "sample_sizes_results.json", 'r') as f:
+                results = json.load(f)
+            
+            successful_results = [r for r in results if r.get('success', False)]
+            
+            if not successful_results:
+                print("⚠️ 성공한 샘플 수 실험 결과가 없음")
+                return
+            
+            # 데이터 준비
+            sample_sizes = [r['num_samples'] for r in successful_results]
+            final_accs = [r.get('final_target_acc', 0) for r in successful_results]
+            improvements = [r.get('improvement', 0) for r in successful_results]
+            unlearning_counts = [r.get('unlearning_count', 0) for r in successful_results]
+            
+            # 시각화
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+            
+            # 최종 성능 vs 샘플 수
+            ax1.plot(sample_sizes, final_accs, 'o-', color='blue', linewidth=2, markersize=8)
+            ax1.set_title('OfficeHome: Final Performance vs Target Sample Size')
+            ax1.set_xlabel('Target Sample Size')
+            ax1.set_ylabel('Target Accuracy (%)')
+            ax1.grid(True, alpha=0.3)
+            
+            # 성능 개선 vs 샘플 수
+            ax2.plot(sample_sizes, improvements, 'o-', color='green', linewidth=2, markersize=8)
+            ax2.set_title('OfficeHome: Performance Improvement vs Target Sample Size')
+            ax2.set_xlabel('Target Sample Size')
+            ax2.set_ylabel('Performance Improvement (%)')
+            ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+            ax2.grid(True, alpha=0.3)
+            
+            # 언러닝 횟수 vs 샘플 수
+            ax3.bar(sample_sizes, unlearning_counts, color='orange', alpha=0.7)
+            ax3.set_title('OfficeHome: Unlearning Count vs Target Sample Size')
+            ax3.set_xlabel('Target Sample Size')
+            ax3.set_ylabel('Unlearning Count')
+            ax3.grid(True, alpha=0.3)
+            
+            # 효율성 (개선/샘플수)
+            efficiency = [imp/size*100 for imp, size in zip(improvements, sample_sizes)]
+            ax4.plot(sample_sizes, efficiency, 'o-', color='purple', linewidth=2, markersize=8)
+            ax4.set_title('OfficeHome: Sample Efficiency (Improvement/Size × 100)')
+            ax4.set_xlabel('Target Sample Size')
+            ax4.set_ylabel('Efficiency')
+            ax4.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "sample_sizes_analysis.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 샘플 수 시각화 실패: {e}")
+    
+    def _plot_hyperparameter_heatmap(self, viz_dir: Path) -> None:
+        """하이퍼파라미터 히트맵"""
+        try:
+            with open(self.results_dir / "hyperparameter_results.json", 'r') as f:
+                results = json.load(f)
+            
+            successful_results = [r for r in results if r.get('success', False)]
+            
+            if not successful_results:
+                print("⚠️ 성공한 하이퍼파라미터 실험 결과가 없음")
+                return
+            
+            # 데이터 준비
+            df = pd.DataFrame(successful_results)
+            pivot_final = df.pivot(index='beta_uncertainty', columns='lambda_utility', values='final_target_acc')
+            pivot_improvement = df.pivot(index='beta_uncertainty', columns='lambda_utility', values='improvement')
+            
+            # 시각화
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # 최종 성능 히트맵
+            sns.heatmap(pivot_final, annot=True, cmap='Blues', ax=ax1, fmt='.2f')
+            ax1.set_title('OfficeHome: Hyperparameter Final Performance (%)')
+            ax1.set_xlabel('λ_u (Utility Weight)')
+            ax1.set_ylabel('β (Uncertainty Weight)')
+            
+            # 성능 개선 히트맵
+            sns.heatmap(pivot_improvement, annot=True, cmap='RdYlGn', center=0, ax=ax2, fmt='.2f')
+            ax2.set_title('OfficeHome: Hyperparameter Performance Improvement (%)')
+            ax2.set_xlabel('λ_u (Utility Weight)')
+            ax2.set_ylabel('β (Uncertainty Weight)')
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "hyperparameter_heatmap.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 하이퍼파라미터 시각화 실패: {e}")
+    
+    def _plot_unlearning_effects(self, viz_dir: Path) -> None:
+        """언러닝 효과 시각화"""
+        try:
+            # 모든 실험 결과에서 언러닝 효과 분석
+            all_results = []
+            
+            for file_name in ["domain_pairs_results.json", "sample_sizes_results.json", "hyperparameter_results.json"]:
+                file_path = self.results_dir / file_name
+                if file_path.exists():
+                    with open(file_path, 'r') as f:
+                        results = json.load(f)
+                        all_results.extend([r for r in results if r.get('success', False)])
+            
+            if not all_results:
+                print("⚠️ 언러닝 효과 분석할 데이터 없음")
+                return
+            
+            # 데이터 준비
+            unlearning_counts = [r.get('unlearning_count', 0) for r in all_results]
+            improvements = [r.get('improvement', 0) for r in all_results]
+            
+            # 언러닝 횟수별 그룹화
+            unlearning_groups = {}
+            for count, improvement in zip(unlearning_counts, improvements):
+                if count not in unlearning_groups:
+                    unlearning_groups[count] = []
+                unlearning_groups[count].append(improvement)
+            
+            # 시각화
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # 언러닝 횟수 vs 성능 개선 산점도
+            ax1.scatter(unlearning_counts, improvements, alpha=0.6, s=50, color='coral')
+            ax1.set_title('OfficeHome: Unlearning Count vs Performance Improvement')
+            ax1.set_xlabel('Unlearning Count')
+            ax1.set_ylabel('Performance Improvement (%)')
+            ax1.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+            ax1.grid(True, alpha=0.3)
+            
+            # 언러닝 횟수별 평균 개선량
+            counts = sorted(unlearning_groups.keys())
+            avg_improvements = [np.mean(unlearning_groups[count]) for count in counts]
+            
+            ax2.bar(counts, avg_improvements, color='lightgreen', alpha=0.7)
+            ax2.set_title('OfficeHome: Average Performance Improvement by Unlearning Count')
+            ax2.set_xlabel('Unlearning Count')
+            ax2.set_ylabel('Average Performance Improvement (%)')
+            ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(viz_dir / "unlearning_effects.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"⚠️ 언러닝 효과 시각화 실패: {e}")
+    
+    def generate_summary_report(self) -> None:
+        """종합 결과 리포트 생성"""
+        print(f"\n📋 OfficeHome 종합 결과 리포트 생성 중...")
         
-        return df
+        report = []
+        report.append("# OfficeHome SDA-U 종합 실험 리포트\n")
+        report.append(f"생성 시간: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        report.append(f"데이터셋: OfficeHome (4개 도메인, 65개 클래스)\n")
+        display_names = [self.domain_display_names[d] for d in self.domains]
+        report.append(f"도메인: {', '.join(display_names)}\n\n")
+        
+        # 각 실험별 요약
+        for experiment_name, file_name in [
+            ("도메인 쌍 실험", "domain_pairs_results.json"),
+            ("샘플 수 실험", "sample_sizes_results.json"),
+            ("하이퍼파라미터 실험", "hyperparameter_results.json")
+        ]:
+            file_path = self.results_dir / file_name
+            if file_path.exists():
+                with open(file_path, 'r') as f:
+                    results = json.load(f)
+                
+                successful = [r for r in results if r.get('success', False)]
+                total = len(results)
+                success_rate = len(successful) / total * 100 if total > 0 else 0
+                
+                report.append(f"## {experiment_name}\n")
+                report.append(f"- 총 실험: {total}개\n")
+                report.append(f"- 성공: {len(successful)}개 ({success_rate:.1f}%)\n")
+                
+                if successful:
+                    avg_improvement = np.mean([r.get('improvement', 0) for r in successful])
+                    max_improvement = max([r.get('improvement', 0) for r in successful])
+                    avg_unlearning = np.mean([r.get('unlearning_count', 0) for r in successful])
+                    
+                    report.append(f"- 평균 성능 개선: {avg_improvement:.2f}%\n")
+                    report.append(f"- 최대 성능 개선: {max_improvement:.2f}%\n")
+                    report.append(f"- 평균 언러닝 횟수: {avg_unlearning:.1f}회\n")
+                
+                report.append("\n")
+        
+        # 리포트 저장
+        report_file = self.results_dir / "comprehensive_report.md"
+        with open(report_file, 'w', encoding='utf-8') as f:
+            f.writelines(report)
+        
+        print(f"✅ OfficeHome 종합 리포트 생성 완료: {report_file}")
 
 def main():
-    """메인 실행 함수"""
-    
-    parser = argparse.ArgumentParser(description='Office-Home 전체 실험 실행')
-    parser.add_argument('--skip_existing', action='store_true', default=True,
-                       help='기존 결과 건너뛰기 (기본: True)')
-    parser.add_argument('--max_parallel', type=int, default=1,
-                       help='최대 병렬 실행 수 (기본: 1)')
-    parser.add_argument('--config_file', type=str, default=None,
-                       help='사용자 정의 설정 파일 (JSON)')
+    """메인 함수"""
+    parser = argparse.ArgumentParser(description='OfficeHome 종합 실험 도구')
+    parser.add_argument('--experiment', type=str, 
+                       choices=['domain_pairs', 'sample_sizes', 'hyperparams', 'all'],
+                       default='all', help='실행할 실험 종류')
+    parser.add_argument('--config', type=str, default='config.json', help='기본 설정 파일')
+    parser.add_argument('--visualize', action='store_true', help='시각화 생성')
     
     args = parser.parse_args()
     
-    # 사용자 정의 설정 로드
-    base_config = None
-    if args.config_file and os.path.exists(args.config_file):
-        with open(args.config_file, 'r', encoding='utf-8') as f:
-            base_config = json.load(f)
-        print(f"📄 사용자 정의 설정 로드: {args.config_file}")
+    print("🎯 OfficeHome 종합 실험 도구 시작!")
+    print("="*60)
     
-    # 실험 러너 생성
-    runner = OfficeHomeExperimentRunner(base_config=base_config)
+    # 실험 러너 초기화
+    runner = OfficeHomeExperimentRunner(args.config)
     
-    # 전체 실험 실행
-    results = runner.run_all_experiments(
-        skip_existing=args.skip_existing,
-        max_parallel=args.max_parallel
-    )
+    # 실험 실행
+    if args.experiment == 'domain_pairs' or args.experiment == 'all':
+        runner.run_domain_pairs_experiment()
     
-    print(f"\n🎉 모든 Office-Home 실험 완료!")
-    print(f"📁 결과 확인: {runner.results_dir}")
+    if args.experiment == 'sample_sizes' or args.experiment == 'all':
+        runner.run_sample_sizes_experiment()
+    
+    if args.experiment == 'hyperparams' or args.experiment == 'all':
+        runner.run_hyperparameter_experiment()
+    
+    # 시각화 및 리포트 생성
+    if args.visualize or args.experiment == 'all':
+        runner.create_visualizations()
+    
+    runner.generate_summary_report()
+    
+    print("\n🎉 OfficeHome 종합 실험 완료!")
+    print(f"📂 결과 확인: {runner.results_dir}")
 
 if __name__ == "__main__":
     main() 
